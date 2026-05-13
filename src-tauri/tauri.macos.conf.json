@@ -1,0 +1,23 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "DroidPilot",
+        "width": 960,
+        "height": 600,
+        "minWidth": 720,
+        "minHeight": 600,
+        "backgroundColor": "#f8fafc",
+        "transparent": false,
+        "shadow": true,
+        "decorations": true,
+        "hiddenTitle": true,
+        "titleBarStyle": "Overlay",
+        "trafficLightPosition": {
+          "x": 14,
+          "y": 20
+        }
+      }
+    ]
+  }
+}
