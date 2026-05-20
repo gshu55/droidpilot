@@ -2386,7 +2386,8 @@ pub fn run() {
             scrcpy::attach_scrcpy_mirror,
             scrcpy::stop_scrcpy_mirror,
             scrcpy::scrcpy_touch,
-            scrcpy::scrcpy_keyevent
+            scrcpy::scrcpy_keyevent,
+            scrcpy::scrcpy_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

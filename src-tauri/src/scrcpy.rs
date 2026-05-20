@@ -16,6 +16,7 @@ const DEVICE_SERVER_PATH: &str = "/data/local/tmp/scrcpy-server.jar";
 const DEVICE_NAME_FIELD_LENGTH: usize = 64;
 const POINTER_ID_GENERIC_FINGER: u64 = u64::MAX - 1;
 const ADB_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const INJECT_TEXT_MAX_BYTES: usize = 300;
 
 #[cfg(has_embedded_scrcpy_server)]
 static SCRCPY_SERVER: &[u8] = include_bytes!("../binaries/scrcpy/scrcpy-server-v3.3.4");
@@ -657,6 +658,28 @@ fn serialize_keycode(action: u8, keycode: u32) -> Vec<u8> {
     buf
 }
 
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn serialize_text(text: &str) -> Vec<u8> {
+    let text = truncate_utf8(text, INJECT_TEXT_MAX_BYTES);
+    let bytes = text.as_bytes();
+    let mut buf = Vec::with_capacity(1 + 4 + bytes.len());
+    buf.push(1);
+    write_u32be(&mut buf, bytes.len() as u32);
+    buf.extend_from_slice(bytes);
+    buf
+}
+
 #[tauri::command]
 pub async fn scrcpy_keyevent(
     registry: State<'_, ScrcpyRegistry>,
@@ -679,4 +702,27 @@ pub async fn scrcpy_keyevent(
     })
     .await
     .map_err(|err| format!("按键任务失败: {err}"))?
+}
+
+#[tauri::command]
+pub async fn scrcpy_text(
+    registry: State<'_, ScrcpyRegistry>,
+    session_id: u64,
+    text: String,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let registry = registry.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let payload = serialize_text(&text);
+        with_control_stream(&registry, session_id, |stream| {
+            stream
+                .write_all(&payload)
+                .map_err(|err| format!("发送文本输入失败: {err}"))
+        })
+    })
+    .await
+    .map_err(|err| format!("文本输入任务失败: {err}"))?
 }

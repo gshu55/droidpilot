@@ -1,4 +1,4 @@
-# DroidPilot 智控助手 v1.0.0
+# DroidPilot 智控助手 v1.0.2
 
 基于 Tauri + Vue3 + TypeScript 的桌面端 ADB 工具，面向开发、测试和排障场景，提供常用命令快捷执行、设备识别、文件上传下载、历史与收藏等能力。
 

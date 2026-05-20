@@ -3783,6 +3783,21 @@ async function sendKey(keycode: number) {
   }
 }
 
+async function sendText(text: string) {
+  const tab = activeMirrorTab.value;
+  if (!tab?.session || tab.state !== "running" || tab.autoRestarting || !text) {
+    return;
+  }
+  try {
+    await invoke("scrcpy_text", {
+      sessionId: tab.session.sessionId,
+      text,
+    });
+  } catch (error) {
+    adbStore.setNotice("error", String(error));
+  }
+}
+
 async function pickLocalBrowserDirectory() {
   const selected = await open({
     directory: true,
@@ -5005,6 +5020,21 @@ const shortcutKeyLabels: Record<string, string> = {
   ArrowUp: "Up",
   Escape: "Esc",
 };
+const mirrorKeyboardKeycodes: Record<string, number> = {
+  ArrowDown: 20,
+  ArrowLeft: 21,
+  ArrowRight: 22,
+  ArrowUp: 19,
+  Backspace: 67,
+  Delete: 112,
+  End: 123,
+  Enter: 66,
+  Escape: 111,
+  Home: 122,
+  PageDown: 93,
+  PageUp: 92,
+  Tab: 61,
+};
 
 function normalizeShortcutPart(value: string) {
   const lower = value.trim().toLowerCase();
@@ -5073,6 +5103,53 @@ function isEditableKeyboardTarget(target: EventTarget | null) {
   }
   const tagName = target.tagName.toLowerCase();
   return tagName === "input" || tagName === "textarea" || tagName === "select" || target.isContentEditable;
+}
+
+function canForwardMirrorKeyboardInput(event: KeyboardEvent) {
+  const tab = activeMirrorTab.value;
+  return Boolean(
+    isActiveWorkspaceMirror.value
+      && tab?.session
+      && tab.state === "running"
+      && !tab.autoRestarting
+      && !event.defaultPrevented
+      && !isEditableKeyboardTarget(event.target),
+  );
+}
+
+function mirrorKeyboardText(event: KeyboardEvent) {
+  if (event.ctrlKey || event.altKey || event.metaKey || event.isComposing || event.key === "Process") {
+    return "";
+  }
+  return event.key.length === 1 ? event.key : "";
+}
+
+function forwardMirrorKeyboardInput(event: KeyboardEvent) {
+  if (!canForwardMirrorKeyboardInput(event)) {
+    return false;
+  }
+
+  const text = mirrorKeyboardText(event);
+  if (text) {
+    event.preventDefault();
+    event.stopPropagation();
+    void sendText(text);
+    return true;
+  }
+
+  if (event.ctrlKey || event.altKey || event.metaKey || event.isComposing) {
+    return false;
+  }
+
+  const keycode = mirrorKeyboardKeycodes[event.key];
+  if (!keycode) {
+    return false;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  void sendKey(keycode);
+  return true;
 }
 
 function activeImageEditor() {
@@ -5154,6 +5231,9 @@ function handleMirrorKeydown(event: KeyboardEvent) {
     return;
   }
   if (isEditableKeyboardTarget(event.target)) {
+    return;
+  }
+  if (forwardMirrorKeyboardInput(event)) {
     return;
   }
   const editor = activeImageEditor();
