@@ -133,6 +133,7 @@ interface MirrorTab {
   statusText: string;
   startToken: number;
   startRecoveryCount: number;
+  autoRestarting: boolean;
   session: ScrcpyStartResult | null;
   decodedFrames: number;
   droppedFrames: number;
@@ -352,7 +353,7 @@ const pendingScrcpyFrames = new Map<number, ScrcpyFramePayload[]>();
 const pendingScrcpyStatuses = new Map<number, ScrcpyStatusPayload>();
 const mirrorFirstFrameTimers = new Map<number, number>();
 const MIRROR_START_TIMEOUT_MS = 32_000;
-const MIRROR_AUTO_RESTART_DELAY_MS = 1_500;
+const MIRROR_AUTO_RESTART_DELAY_MS = 5_000;
 const MAX_PENDING_SCRCPY_FRAMES = 360;
 const MAX_INITIAL_SCRCPY_FLUSH_TAIL_FRAMES = 2;
 
@@ -375,6 +376,7 @@ function createMirrorTab(id = nextMirrorTabId++): MirrorTab {
     statusText: "等待启动",
     startToken: 0,
     startRecoveryCount: 0,
+    autoRestarting: false,
     session: null,
     decodedFrames: 0,
     droppedFrames: 0,
@@ -638,6 +640,9 @@ const mirrorToggleLabel = computed(() => {
   if (!isActiveWorkspaceMirror.value) {
     return existingActiveMirrorTab.value ? "打开投屏" : "开始投屏";
   }
+  if (activeMirrorAutoRestarting.value) {
+    return "重连中";
+  }
   if (state.value === "starting") {
     return "取消启动";
   }
@@ -652,10 +657,15 @@ const mirrorToggleLabel = computed(() => {
 const isActiveWorkspaceMirror = computed(() => activeWorkspaceTabKey.value.startsWith("mirror:"));
 const activeMirrorRecording = computed(() => recording.value && recordingMirrorTabId.value === activeMirrorTab.value?.id);
 const activeMirrorSavingRecording = computed(() => savingLocalRecording.value && recordingMirrorTabId.value === activeMirrorTab.value?.id);
+const activeMirrorAutoRestarting = computed(() => Boolean(activeMirrorTab.value?.autoRestarting));
 const canRecordActiveMirror = computed(() => {
   return isActiveWorkspaceMirror.value
     && state.value === "running"
     && (!recording.value || activeMirrorRecording.value);
+});
+const canSendKeysActiveMirror = computed(() => {
+  const tab = activeMirrorTab.value;
+  return Boolean(tab?.session && tab.state === "running" && !tab.autoRestarting);
 });
 const canScreenshotActiveMirror = computed(() => {
   const tab = activeMirrorTab.value;
@@ -669,14 +679,14 @@ const canScreenshotActiveMirror = computed(() => {
       && tab.canvas.height > 0,
   );
 });
-const mirrorToggleDisabled = computed(() => isActiveWorkspaceMirror.value && state.value === "stopping");
-const mirrorToggleDanger = computed(() => isActiveWorkspaceMirror.value && (state.value === "starting" || state.value === "running" || state.value === "error"));
+const mirrorToggleDisabled = computed(() => isActiveWorkspaceMirror.value && (state.value === "stopping" || activeMirrorAutoRestarting.value));
+const mirrorToggleDanger = computed(() => isActiveWorkspaceMirror.value && !activeMirrorAutoRestarting.value && (state.value === "starting" || state.value === "running" || state.value === "error"));
 function emitMirrorToolbarState() {
   window.dispatchEvent(
     new CustomEvent("droidpilot:mirror-toolbar-state", {
       detail: {
         canUseMirrorControls: true,
-        canSendKeys: isActiveWorkspaceMirror.value && state.value === "running",
+        canSendKeys: canSendKeysActiveMirror.value,
         mirrorToggleDanger: mirrorToggleDanger.value,
         mirrorToggleDisabled: mirrorToggleDisabled.value,
         mirrorToggleLabel: mirrorToggleLabel.value,
@@ -695,28 +705,12 @@ watchEffect(() => {
   emitMirrorToolbarState();
 });
 
+function syncMirrorToolbarState() {
+  emitMirrorToolbarState();
+  void nextTick(emitMirrorToolbarState);
+}
+
 function screenPlaceholderFor(tab: MirrorTab) {
-  if (tab.state === "starting") {
-    return {
-      title: "正在连接",
-      message: "正在启动投屏服务，请稍候",
-    };
-  }
-
-  if (tab.state === "running" && !tab.decoderReady) {
-    return {
-      title: "等待画面",
-      message: "视频通道已连接，正在等待首帧",
-    };
-  }
-
-  if (tab.state === "stopping") {
-    return {
-      title: "正在停止",
-      message: "正在关闭投屏连接",
-    };
-  }
-
   if (tab.state === "error") {
     return {
       title: "投屏异常",
@@ -736,9 +730,15 @@ function screenPlaceholderFor(tab: MirrorTab) {
     message: tab.statusText === "已停止" ? "投屏已停止，可重新开始" : "点击开始投屏",
   };
 }
+
+function shouldShowScreenPlaceholder(tab: MirrorTab) {
+  return tab.state !== "starting" && tab.state !== "stopping" && tab.state !== "running";
+}
+
 function setState(tab: MirrorTab, nextState: MirrorState, message: string) {
   tab.state = nextState;
   tab.statusText = message;
+  syncMirrorToolbarState();
 }
 
 function homeShortcutKeyParts(shortcut: AppShortcut) {
@@ -2729,10 +2729,10 @@ function mirrorTabStatus(tab: MirrorTab) {
     return "运行中";
   }
   if (tab.state === "starting") {
-    return "启动中";
+    return "";
   }
   if (tab.state === "stopping") {
-    return "停止中";
+    return "";
   }
   if (tab.state === "error") {
     return "异常";
@@ -2871,6 +2871,7 @@ function cancelMirrorStart(tab: MirrorTab, message = "已取消启动") {
   mirrorDebug("start-cancel", { tabId: tab.id, token: tab.startToken, sessionId: tab.session?.sessionId, message });
   tab.startToken = nextMirrorStartToken++;
   clearMirrorFirstFrameWatch(tab);
+  tab.autoRestarting = false;
   tab.session = null;
   tab.latestConfigPacket = null;
   tab.pendingConfigPacket = null;
@@ -2917,6 +2918,7 @@ function activateMirrorTab(tabId: number) {
   if (mirrorTabs.value.some((tab) => tab.id === tabId)) {
     activeMirrorTabId.value = tabId;
     activeWorkspaceTabKey.value = mirrorTabKey(tabId);
+    syncMirrorToolbarState();
     scrollWorkspaceTabIntoView();
   }
 }
@@ -2924,9 +2926,10 @@ function activateMirrorTab(tabId: number) {
 function addMirrorTab() {
   const tab = createMirrorTab();
   mirrorTabs.value.push(tab);
-  registerWorkspaceTab(mirrorTabKey(tab.id));
-  activateMirrorTab(tab.id);
-  return tab;
+  const reactiveTab = mirrorTabs.value[mirrorTabs.value.length - 1];
+  registerWorkspaceTab(mirrorTabKey(reactiveTab.id));
+  activateMirrorTab(reactiveTab.id);
+  return reactiveTab;
 }
 
 function activateWorkspaceTab(tab: WorkspaceTab) {
@@ -2934,6 +2937,7 @@ function activateWorkspaceTab(tab: WorkspaceTab) {
   scrollWorkspaceTabIntoView(tab.key);
   if (tab.kind === "mirror") {
     activeMirrorTabId.value = tab.mirror.id;
+    syncMirrorToolbarState();
     return;
   }
   if (tab.kind === "screenshot") {
@@ -3152,15 +3156,16 @@ function ensureDecoder(tab: MirrorTab) {
       tab.decodedFrames++;
       if (tab.decodedFrames === 1) {
         tab.decoderReady = true;
-      mirrorDebug("first-frame-decoded", {
-        tabId: tab.id,
-        sessionId: decoderSessionId,
-        token: decoderStartToken,
-        width: canvas.width,
-        height: canvas.height,
-        canvas: canvasDebugInfo(tab),
-        droppedFrames: tab.droppedFrames,
-      });
+        syncMirrorToolbarState();
+        mirrorDebug("first-frame-decoded", {
+          tabId: tab.id,
+          sessionId: decoderSessionId,
+          token: decoderStartToken,
+          width: canvas.width,
+          height: canvas.height,
+          canvas: canvasDebugInfo(tab),
+          droppedFrames: tab.droppedFrames,
+        });
         clearMirrorFirstFrameWatch(tab);
       }
     },
@@ -3334,25 +3339,35 @@ function handleStatus(payload: ScrcpyStatusPayload) {
     droppedFrames: tab.droppedFrames,
   });
   tab.statusText = payload.message;
+  if (payload.status === "running") {
+    if (tab.state !== "stopping") {
+      tab.autoRestarting = false;
+      setState(tab, "running", payload.message || "视频通道已连接");
+    }
+    return;
+  }
   if (payload.status === "stopped") {
     clearMirrorFirstFrameWatch(tab);
     stopRecordingForMirror(tab);
-    tab.state = "idle";
+    tab.autoRestarting = false;
     tab.session = null;
     tab.latestConfigPacket = null;
     tab.pendingConfigPacket = null;
     tab.pointerActive = false;
     closeDecoder(tab);
+    setState(tab, "idle", payload.message || "已停止");
+    return;
   }
   if (payload.status === "error") {
     clearMirrorFirstFrameWatch(tab);
     stopRecordingForMirror(tab);
-    tab.state = "error";
+    tab.autoRestarting = false;
     tab.session = null;
     tab.latestConfigPacket = null;
     tab.pendingConfigPacket = null;
     tab.pointerActive = false;
     closeDecoder(tab);
+    setState(tab, "error", payload.message || "投屏连接失败");
   }
 }
 
@@ -3414,12 +3429,24 @@ function scheduleMirrorAutoRestart(tab: MirrorTab, startToken: number, sessionId
       || tab.state !== "running"
       || tab.session?.sessionId !== sessionId
       || tab.startRecoveryCount >= 1
+      || hasMirrorVideoActivity(tab, sessionId)
     ) {
       return;
     }
     void restartMirrorOnceAfterDelay(tab, startToken, sessionId);
   }, MIRROR_AUTO_RESTART_DELAY_MS);
   mirrorFirstFrameTimers.set(tab.id, timer);
+}
+
+function hasMirrorVideoActivity(tab: MirrorTab, sessionId: number) {
+  // The first WebCodecs output can be slower than the first scrcpy packets on a cold WebView.
+  // Do not restart a live stream just because the decoded frame has not surfaced yet.
+  return Boolean(
+    tab.decoder
+      || tab.latestConfigPacket
+      || tab.droppedFrames > 0
+      || pendingScrcpyFrames.get(sessionId)?.length,
+  );
 }
 
 async function restartMirrorOnceAfterDelay(tab: MirrorTab, startToken: number, sessionId: number) {
@@ -3434,6 +3461,8 @@ async function restartMirrorOnceAfterDelay(tab: MirrorTab, startToken: number, s
     decoderReady: tab.decoderReady,
   });
   tab.startRecoveryCount += 1;
+  tab.autoRestarting = true;
+  syncMirrorToolbarState();
   clearPendingScrcpySession(sessionId);
   tab.session = null;
   tab.latestConfigPacket = null;
@@ -3450,6 +3479,8 @@ async function restartMirrorOnceAfterDelay(tab: MirrorTab, startToken: number, s
   }
 
   if (tab.startToken !== startToken || tab.state !== "starting") {
+    tab.autoRestarting = false;
+    syncMirrorToolbarState();
     return;
   }
   setState(tab, "idle", "准备重建投屏连接");
@@ -3477,6 +3508,7 @@ async function startMirror(tab = activeMirrorTab.value, options: { keepRecoveryC
   tab.startToken = startToken;
   if (!options.keepRecoveryCount) {
     tab.startRecoveryCount = 0;
+    tab.autoRestarting = false;
   }
   tab.session = null;
   tab.latestConfigPacket = null;
@@ -3515,6 +3547,7 @@ async function startMirror(tab = activeMirrorTab.value, options: { keepRecoveryC
       timeoutMs: MIRROR_START_TIMEOUT_MS,
     });
     tab.startToken = nextMirrorStartToken++;
+    tab.autoRestarting = false;
     setState(tab, "error", "启动投屏超时，请检查设备授权、USB/Wi-Fi ADB 连接后重试");
     adbStore.setNotice("error", "启动投屏超时，请检查设备连接后重试");
   }, MIRROR_START_TIMEOUT_MS);
@@ -3545,6 +3578,7 @@ async function startMirror(tab = activeMirrorTab.value, options: { keepRecoveryC
     tab.session = result;
     tab.title = result.deviceName || result.serial;
     tab.configuredCodec = "avc1.42E01F";
+    tab.autoRestarting = false;
     setState(tab, "running", "视频通道已连接");
     await waitForMirrorCanvas(tab, startToken);
     if (!isMirrorStartAlive(tab, startToken) || tab.session?.sessionId !== result.sessionId || tab.state !== "running") {
@@ -3571,6 +3605,7 @@ async function startMirror(tab = activeMirrorTab.value, options: { keepRecoveryC
     tab.session = null;
     tab.latestConfigPacket = null;
     tab.pendingConfigPacket = null;
+    tab.autoRestarting = false;
     closeDecoder(tab);
     mirrorWarn("start-error", { tabId: tab.id, token: startToken, error: String(error) });
     setState(tab, "error", String(error));
@@ -3593,6 +3628,7 @@ async function stopMirror(tab = activeMirrorTab.value) {
   });
   clearMirrorFirstFrameWatch(tab);
   stopRecordingForMirror(tab);
+  tab.autoRestarting = false;
 
   if (!tab.session) {
     cancelMirrorStart(tab, "等待启动");
@@ -3612,6 +3648,7 @@ async function stopMirror(tab = activeMirrorTab.value) {
     tab.session = null;
     tab.latestConfigPacket = null;
     tab.pendingConfigPacket = null;
+    tab.autoRestarting = false;
     closeDecoder(tab);
     tab.pointerActive = false;
     setState(tab, "idle", "已停止");
@@ -3733,7 +3770,7 @@ function onPointerUp(tab: MirrorTab, event: PointerEvent) {
 
 async function sendKey(keycode: number) {
   const tab = activeMirrorTab.value;
-  if (!tab?.session || tab.state !== "running") {
+  if (!tab?.session || tab.state !== "running" || tab.autoRestarting) {
     return;
   }
   try {
@@ -5217,7 +5254,7 @@ onBeforeUnmount(() => {
           >
             <button class="mirror-tab-main" type="button" @click="activateWorkspaceTab(tab)">
               <span>{{ tab.title }}</span>
-              <small>{{ tab.status }}</small>
+              <small v-if="tab.status">{{ tab.status }}</small>
             </button>
             <button
               class="mirror-tab-close"
@@ -5261,7 +5298,7 @@ onBeforeUnmount(() => {
             @pointerup="onPointerUp(tab, $event)"
             @pointercancel="onPointerUp(tab, $event)"
           ></canvas>
-          <div v-if="tab.state !== 'running' || !tab.decoderReady" class="screen-placeholder">
+          <div v-if="shouldShowScreenPlaceholder(tab)" class="screen-placeholder">
             <strong>{{ screenPlaceholderFor(tab).title }}</strong>
             <span>{{ screenPlaceholderFor(tab).message }}</span>
           </div>
