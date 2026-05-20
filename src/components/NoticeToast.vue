@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, watch } from "vue";
 import type { Notice } from "../stores/adb";
+import { useI18n } from "../i18n";
 
 const props = withDefaults(
   defineProps<{
@@ -15,6 +16,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   close: [];
 }>();
+const { t } = useI18n();
 
 let timer: number | null = null;
 
@@ -49,7 +51,7 @@ onBeforeUnmount(() => {
     <Transition name="toast-fade">
       <section v-if="notice" :class="['toast', `toast-${notice.type}`]" role="status" aria-live="polite">
         <span class="toast-message">{{ notice.message }}</span>
-        <button class="toast-close" type="button" aria-label="关闭提示" @click="emit('close')">x</button>
+        <button class="toast-close" type="button" :aria-label="t('common.close')" @click="emit('close')">x</button>
       </section>
     </Transition>
   </Teleport>
@@ -66,7 +68,7 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   padding: 8px 10px;
   border: 1px solid;
-  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.16);
+  box-shadow: var(--shadow);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -79,9 +81,9 @@ onBeforeUnmount(() => {
 }
 
 .toast-info {
-  background: rgba(239, 246, 255, 0.96);
-  border-color: #bfdbfe;
-  color: #1d4ed8;
+  background: var(--primary-soft);
+  border-color: var(--primary-border);
+  color: var(--primary);
 }
 
 .toast-success {
@@ -91,15 +93,15 @@ onBeforeUnmount(() => {
 }
 
 .toast-error {
-  background: rgba(254, 242, 242, 0.96);
-  border-color: #fecaca;
-  color: #b91c1c;
+  background: var(--danger-soft);
+  border-color: var(--danger-border);
+  color: var(--danger-text);
 }
 
 .toast-close {
   border: 0;
   border-radius: 6px;
-  background: rgba(15, 23, 42, 0.08);
+  background: color-mix(in srgb, currentColor 12%, transparent);
   color: inherit;
   padding: 5px 8px;
   cursor: pointer;

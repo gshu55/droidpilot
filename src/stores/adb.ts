@@ -34,6 +34,8 @@ export type ScreenshotMode = "save" | "copy" | "save-copy";
 export type ScreenshotSource = "native" | "mirror";
 export type PickerCopyFormat = "hex" | "rgb";
 export type MirrorToolbarSide = "left" | "right";
+export type AppLanguage = "zh-CN" | "en-US";
+export type AppTheme = "light" | "dark" | "system";
 
 export interface Notice {
   type: NoticeType;
@@ -81,6 +83,8 @@ interface PersistedState {
   mirrorBitRateMbps: number;
   mirrorMaxFps: number;
   mirrorToolbarSide: MirrorToolbarSide;
+  language: AppLanguage;
+  theme: AppTheme;
   appShortcuts: AppShortcutMap;
 }
 
@@ -111,6 +115,8 @@ interface AdbState {
   mirrorBitRateMbps: number;
   mirrorMaxFps: number;
   mirrorToolbarSide: MirrorToolbarSide;
+  language: AppLanguage;
+  theme: AppTheme;
   appShortcuts: AppShortcutMap;
   transferRecords: TransferRecord[];
 }
@@ -179,6 +185,14 @@ function safeMirrorToolbarSide(value: unknown): MirrorToolbarSide {
   return value === "left" || value === "right" ? value : "right";
 }
 
+function safeAppLanguage(value: unknown): AppLanguage {
+  return value === "en-US" || value === "zh-CN" ? value : "zh-CN";
+}
+
+function safeAppTheme(value: unknown): AppTheme {
+  return value === "dark" || value === "system" || value === "light" ? value : "light";
+}
+
 function normalizeDefaultRemoteDir(value: unknown, fallback: string) {
   if (typeof value !== "string" || !value.trim()) {
     return fallback;
@@ -205,6 +219,8 @@ function loadPersistedState(): PersistedState {
       mirrorBitRateMbps: 8,
       mirrorMaxFps: 60,
       mirrorToolbarSide: "right",
+      language: "zh-CN",
+      theme: "light",
       appShortcuts: { ...defaultAppShortcutMap },
     };
   }
@@ -244,6 +260,8 @@ function loadPersistedState(): PersistedState {
       mirrorBitRateMbps: safePositiveNumber(parsed.mirrorBitRateMbps, 8),
       mirrorMaxFps: safePositiveNumber(parsed.mirrorMaxFps, 60),
       mirrorToolbarSide: safeMirrorToolbarSide(parsed.mirrorToolbarSide),
+      language: safeAppLanguage(parsed.language),
+      theme: safeAppTheme(parsed.theme),
       appShortcuts: normalizeAppShortcutMap(parsed.appShortcuts),
     };
   } catch {
@@ -262,6 +280,8 @@ function loadPersistedState(): PersistedState {
       mirrorBitRateMbps: 8,
       mirrorMaxFps: 60,
       mirrorToolbarSide: "right",
+      language: "zh-CN",
+      theme: "light",
       appShortcuts: { ...defaultAppShortcutMap },
     };
   }
@@ -304,6 +324,8 @@ export const useAdbStore = defineStore("adb", {
       mirrorBitRateMbps: persisted.mirrorBitRateMbps,
       mirrorMaxFps: persisted.mirrorMaxFps,
       mirrorToolbarSide: persisted.mirrorToolbarSide,
+      language: persisted.language,
+      theme: persisted.theme,
       appShortcuts: persisted.appShortcuts,
       transferRecords: persisted.transferRecords,
     };
@@ -333,6 +355,8 @@ export const useAdbStore = defineStore("adb", {
         mirrorBitRateMbps: this.mirrorBitRateMbps,
         mirrorMaxFps: this.mirrorMaxFps,
         mirrorToolbarSide: this.mirrorToolbarSide,
+        language: this.language,
+        theme: this.theme,
         appShortcuts: this.appShortcuts,
       });
     },
@@ -543,6 +567,14 @@ export const useAdbStore = defineStore("adb", {
     },
     setMirrorToolbarSide(value: MirrorToolbarSide) {
       this.mirrorToolbarSide = value;
+      this.savePersisted();
+    },
+    setLanguage(value: AppLanguage) {
+      this.language = safeAppLanguage(value);
+      this.savePersisted();
+    },
+    setTheme(value: AppTheme) {
+      this.theme = safeAppTheme(value);
       this.savePersisted();
     },
     setAppShortcut(action: AppShortcutAction, value: string) {

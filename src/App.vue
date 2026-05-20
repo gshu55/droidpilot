@@ -2,13 +2,17 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { RouterView, useRoute, useRouter } from "vue-router";
 import { storeToRefs } from "pinia";
+import { setTheme as setNativeAppTheme } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAdbStore } from "./stores/adb";
 import NoticeToast from "./components/NoticeToast.vue";
 import { matchAppShortcut, normalizeAppShortcutMap, type AppShortcutAction } from "./config/appShortcuts";
+import { useI18n } from "./i18n";
 
 const adbStore = useAdbStore();
+const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const {
@@ -19,6 +23,7 @@ const {
   selectedSerial,
   screenshotSource,
   mirrorToolbarSide,
+  theme,
 } =
   storeToRefs(adbStore);
 const adbStoreRefs = storeToRefs(adbStore);
@@ -30,9 +35,9 @@ const deviceControlRef = ref<HTMLElement | null>(null);
 const wifiAddress = ref(localStorage.getItem("droidpilot.wifiAddress") || localStorage.getItem("adbtools.wifiAddress") || "");
 const isMaximized = ref(false);
 const titlebarStyle = ref<"windows" | "macos" | "linux">("windows");
+const effectiveTheme = ref<"light" | "dark">("light");
 let maximizeSyncTimer: number | null = null;
-const appBackgroundColor = "#f8fafc";
-const mirrorBackgroundColor = "#f8fafc";
+const colorSchemeQuery = typeof window === "undefined" ? null : window.matchMedia("(prefers-color-scheme: dark)");
 const appWindow = (() => {
   try {
     return getCurrentWindow();
@@ -138,16 +143,16 @@ const mirrorToolbar = ref<MirrorToolbarState>({
 
 const titlebarControls = computed(() => {
   const standardControls = [
-    { key: "minimize" as const, label: "最小化" },
-    { key: "maximize" as const, label: isMaximized.value ? "还原" : "放大" },
-    { key: "close" as const, label: "关闭" },
+    { key: "minimize" as const, label: t("app.minimize") },
+    { key: "maximize" as const, label: isMaximized.value ? t("app.restore") : t("app.maximize") },
+    { key: "close" as const, label: t("app.close") },
   ];
 
   if (titlebarStyle.value === "macos") {
     return [
-      { key: "close" as const, label: "关闭" },
-      { key: "minimize" as const, label: "最小化" },
-      { key: "maximize" as const, label: isMaximized.value ? "还原" : "放大" },
+      { key: "close" as const, label: t("app.close") },
+      { key: "minimize" as const, label: t("app.minimize") },
+      { key: "maximize" as const, label: isMaximized.value ? t("app.restore") : t("app.maximize") },
     ];
   }
 
@@ -169,16 +174,16 @@ const canToolbarScreenshot = computed(() => {
   }
   return canNativeScreenshot.value;
 });
-const screenshotActionLabel = computed(() => (screenshotSource.value === "mirror" ? "投屏截图" : "设备截图"));
+const screenshotActionLabel = computed(() => (screenshotSource.value === "mirror" ? t("app.mirrorScreenshot") : t("app.nativeScreenshot")));
 const screenshotActionTitle = computed(() => {
   if (canToolbarScreenshot.value) {
     return screenshotActionLabel.value;
   }
-  return screenshotSource.value === "mirror" ? "需要切换到正在运行的投屏标签页" : "需要已授权设备";
+  return screenshotSource.value === "mirror" ? t("app.needRunningMirrorTab") : t("app.needAuthorizedDevice");
 });
 const selectedDeviceLabel = computed(() => {
   if (!selectedSerial.value) {
-    return loadingDevices.value ? "加载设备中..." : "请选择设备";
+    return loadingDevices.value ? t("app.loadingDevices") : t("app.noDevice");
   }
   if (!selectedDevice.value) {
     return selectedSerial.value;
@@ -263,10 +268,10 @@ function onMirrorToolbarState(event: Event) {
   };
 }
 
-function sendMirrorToolbarAction(action: MirrorToolbarAction) {
-  if (action === "settings") {
-    void router.push("/settings");
-    return;
+async function sendMirrorToolbarAction(action: MirrorToolbarAction) {
+  if (!isMirrorRoute.value) {
+    await router.push("/mirror");
+    await nextTick();
   }
   window.dispatchEvent(new CustomEvent("droidpilot:mirror-toolbar-action", { detail: action }));
 }
@@ -320,16 +325,39 @@ function handleAppShortcutKeydown(event: KeyboardEvent) {
 }
 
 function syncDocumentBackground(isMirror: boolean) {
+  document.documentElement.dataset.theme = effectiveTheme.value;
+  document.body.dataset.theme = effectiveTheme.value;
   document.documentElement.classList.toggle("mirror-window-bg", isMirror);
   document.body.classList.toggle("mirror-window-bg", isMirror);
 }
 
+function cssVarColor(name: string, fallback: string) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
 async function syncNativeBackground(isMirror: boolean) {
-  const color = isMirror ? mirrorBackgroundColor : appBackgroundColor;
+  const color = isMirror
+    ? cssVarColor("--mirror-toolbar-bg", effectiveTheme.value === "dark" ? "#0b1120" : "#f8fafc")
+    : cssVarColor("--app-window-bg", effectiveTheme.value === "dark" ? "#0b1120" : "#f8fafc");
   await Promise.allSettled([
+    setNativeAppTheme(effectiveTheme.value),
     appWindow?.setBackgroundColor(color),
     currentWebview?.setBackgroundColor(color),
+    invoke("set_window_frame_theme", { isDark: effectiveTheme.value === "dark" }),
   ]);
+}
+
+function resolveEffectiveTheme() {
+  if (theme.value === "system") {
+    return colorSchemeQuery?.matches ? "dark" : "light";
+  }
+  return theme.value;
+}
+
+function syncTheme() {
+  effectiveTheme.value = resolveEffectiveTheme();
+  syncResizeBackground(isMirrorRoute.value);
 }
 
 function syncResizeBackground(isMirror: boolean) {
@@ -461,6 +489,7 @@ onMounted(async () => {
   window.addEventListener("pointerdown", disableRightButtonPress, true);
   document.addEventListener("pointerdown", disableRightButtonPress, true);
   window.addEventListener("resize", scheduleMaximizeStateSync);
+  colorSchemeQuery?.addEventListener("change", syncTheme);
   window.addEventListener("droidpilot:mirror-toolbar-state", onMirrorToolbarState);
   window.addEventListener("keydown", handleAppShortcutKeydown, true);
 });
@@ -478,12 +507,14 @@ onBeforeUnmount(() => {
   window.removeEventListener("pointerdown", disableRightButtonPress, true);
   document.removeEventListener("pointerdown", disableRightButtonPress, true);
   window.removeEventListener("resize", scheduleMaximizeStateSync);
+  colorSchemeQuery?.removeEventListener("change", syncTheme);
   window.removeEventListener("droidpilot:mirror-toolbar-state", onMirrorToolbarState);
   window.removeEventListener("keydown", handleAppShortcutKeydown, true);
   syncDocumentBackground(false);
 });
 
 watch(isMirrorRoute, syncResizeBackground, { immediate: true });
+watch(theme, syncTheme, { immediate: true });
 </script>
 
 <template>
@@ -537,8 +568,8 @@ watch(isMirrorRoute, syncResizeBackground, { immediate: true });
                   class="wifi-connect-submit"
                   type="button"
                   :disabled="!canConnectWifi"
-                  :title="wifiConnecting ? '连接中' : '连接 Wi-Fi ADB'"
-                  :aria-label="wifiConnecting ? '连接中' : '连接 Wi-Fi ADB'"
+                  :title="wifiConnecting ? t('app.connecting') : t('app.connectWifi')"
+                  :aria-label="wifiConnecting ? t('app.connecting') : t('app.connectWifi')"
                   @click="connectWifiAdb"
                 >
                   <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -562,8 +593,8 @@ watch(isMirrorRoute, syncResizeBackground, { immediate: true });
                 type="button"
                 class="device-disconnect"
                 :disabled="wifiDisconnectingSerial === item.serial"
-                :title="wifiDisconnectingSerial === item.serial ? `正在断开 ${item.serial}` : `断开 ${item.serial}`"
-                :aria-label="wifiDisconnectingSerial === item.serial ? `正在断开 ${item.serial}` : `断开 ${item.serial}`"
+                :title="wifiDisconnectingSerial === item.serial ? t('app.disconnectingDevice', { serial: item.serial }) : t('app.disconnectDevice', { serial: item.serial })"
+                :aria-label="wifiDisconnectingSerial === item.serial ? t('app.disconnectingDevice', { serial: item.serial }) : t('app.disconnectDevice', { serial: item.serial })"
                 @click.stop="disconnectWifiDevice(item.serial)"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -571,14 +602,14 @@ watch(isMirrorRoute, syncResizeBackground, { immediate: true });
                 </svg>
               </button>
             </div>
-            <div v-if="devices.length === 0" class="device-empty">暂无设备，请点击刷新</div>
+            <div v-if="devices.length === 0" class="device-empty">{{ t("app.noDevices") }}</div>
           </div>
         </div>
         <button
           class="toolbar-icon-btn refresh-btn"
           :disabled="checking || loadingDevices"
-          aria-label="刷新设备"
-          title="刷新设备"
+          :aria-label="t('app.refreshDevices')"
+          :title="t('app.refreshDevices')"
           @click="refreshDevices"
         >
           <svg class="toolbar-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -629,11 +660,11 @@ watch(isMirrorRoute, syncResizeBackground, { immediate: true });
 
         <div class="root-side-section">
           <div class="root-key-grid">
-            <button class="root-icon-btn" type="button" :disabled="!mirrorToolbar.canSendKeys" aria-label="返回" title="返回" @click="sendMirrorToolbarAction('back')">
+            <button class="root-icon-btn" type="button" :disabled="!mirrorToolbar.canSendKeys" :aria-label="t('app.back')" :title="t('app.back')" @click="sendMirrorToolbarAction('back')">
               <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                 <path v-for="path in appIconPaths.arrowLeft" :key="path" :d="path" />
               </svg>
-              <span>返回</span>
+              <span>{{ t("app.back") }}</span>
             </button>
             <button class="root-icon-btn" type="button" :disabled="!mirrorToolbar.canSendKeys" aria-label="Home" title="Home" @click="sendMirrorToolbarAction('home')">
               <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
@@ -641,17 +672,17 @@ watch(isMirrorRoute, syncResizeBackground, { immediate: true });
               </svg>
               <span>Home</span>
             </button>
-            <button class="root-icon-btn" type="button" :disabled="!mirrorToolbar.canSendKeys" aria-label="多任务" title="多任务" @click="sendMirrorToolbarAction('tasks')">
+            <button class="root-icon-btn" type="button" :disabled="!mirrorToolbar.canSendKeys" :aria-label="t('app.tasks')" :title="t('app.tasks')" @click="sendMirrorToolbarAction('tasks')">
               <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                 <path v-for="path in appIconPaths.layers" :key="path" :d="path" />
               </svg>
-              <span>多任务</span>
+              <span>{{ t("app.tasks") }}</span>
             </button>
-            <button class="root-icon-btn" type="button" :disabled="!mirrorToolbar.canSendKeys" aria-label="电源" title="电源" @click="sendMirrorToolbarAction('power')">
+            <button class="root-icon-btn" type="button" :disabled="!mirrorToolbar.canSendKeys" :aria-label="t('app.power')" :title="t('app.power')" @click="sendMirrorToolbarAction('power')">
               <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                 <path v-for="path in appIconPaths.power" :key="path" :d="path" />
               </svg>
-              <span>电源</span>
+              <span>{{ t("app.power") }}</span>
             </button>
           </div>
         </div>
@@ -669,35 +700,35 @@ watch(isMirrorRoute, syncResizeBackground, { immediate: true });
               :class="{ 'root-icon-btn-recording': mirrorToolbar.recording }"
               type="button"
               :disabled="!mirrorToolbar.canRecord || mirrorToolbar.quickBusy || mirrorToolbar.savingLocalRecording"
-              :aria-label="mirrorToolbar.savingLocalRecording ? '保存录屏' : mirrorToolbar.recording ? '停止录屏' : '录屏'"
-              :title="mirrorToolbar.savingLocalRecording ? '保存录屏' : mirrorToolbar.recording ? '停止录屏' : '录屏'"
+              :aria-label="mirrorToolbar.savingLocalRecording ? t('app.saveRecording') : mirrorToolbar.recording ? t('app.stopRecording') : t('app.record')"
+              :title="mirrorToolbar.savingLocalRecording ? t('app.saveRecording') : mirrorToolbar.recording ? t('app.stopRecording') : t('app.record')"
               @click="sendMirrorToolbarAction('record')"
             >
               <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                 <path v-for="path in mirrorToolbar.recording ? appIconPaths.square : appIconPaths.video" :key="path" :d="path" />
               </svg>
-              <span>{{ mirrorToolbar.savingLocalRecording ? "保存中" : mirrorToolbar.recording ? mirrorToolbar.recordingElapsedLabel : "录屏" }}</span>
+              <span>{{ mirrorToolbar.savingLocalRecording ? t("common.saving") : mirrorToolbar.recording ? mirrorToolbar.recordingElapsedLabel : t("app.record") }}</span>
             </button>
-            <button class="root-icon-btn" type="button" :disabled="mirrorToolbar.quickBusy" aria-label="文件传输" title="文件传输" @click="sendMirrorToolbarAction('transfer')">
+            <button class="root-icon-btn" type="button" :disabled="mirrorToolbar.quickBusy" :aria-label="t('app.fileTransfer')" :title="t('app.fileTransfer')" @click="sendMirrorToolbarAction('transfer')">
               <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                 <path v-for="path in appIconPaths.fileUp" :key="path" :d="path" />
               </svg>
-              <span>文件传输</span>
+              <span>{{ t("app.fileTransfer") }}</span>
             </button>
-            <button class="root-icon-btn" type="button" :disabled="mirrorToolbar.quickBusy" aria-label="快捷终端" title="快捷终端" @click="sendMirrorToolbarAction('terminal')">
+            <button class="root-icon-btn" type="button" :disabled="mirrorToolbar.quickBusy" :aria-label="t('app.terminal')" :title="t('app.terminal')" @click="sendMirrorToolbarAction('terminal')">
               <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                 <path v-for="path in appIconPaths.terminal" :key="path" :d="path" />
               </svg>
-              <span>快捷终端</span>
+              <span>{{ t("app.terminal") }}</span>
             </button>
           </div>
         </div>
         <div class="root-side-section root-settings-section">
-          <button class="root-icon-btn root-settings-action-btn" type="button" aria-label="设置" title="设置" @click="sendMirrorToolbarAction('settings')">
+          <button class="root-icon-btn root-settings-action-btn" type="button" :aria-label="t('common.settings')" :title="t('common.settings')" @click="sendMirrorToolbarAction('settings')">
             <svg class="root-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
               <path v-for="path in appIconPaths.settings" :key="path" :d="path" />
             </svg>
-            <span>设置</span>
+            <span>{{ t("common.settings") }}</span>
           </button>
         </div>
       </aside>

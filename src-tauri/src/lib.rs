@@ -131,18 +131,40 @@ fn get_adb_path() -> &'static PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_windows_window_frame<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+fn apply_windows_window_frame<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    is_dark: bool,
+) {
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 
     const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(34);
-    const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFE;
+    const DWMWA_CAPTION_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(35);
+    const DWMWA_TEXT_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(36);
+    const DARK_FRAME: u32 = 0x20110B;
+    const LIGHT_FRAME: u32 = 0xFCFAF8;
+    const DARK_TEXT: u32 = 0xF7EDE5;
+    const LIGHT_TEXT: u32 = 0x2A170F;
+    let frame_color = if is_dark { DARK_FRAME } else { LIGHT_FRAME };
+    let text_color = if is_dark { DARK_TEXT } else { LIGHT_TEXT };
 
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
             let _ = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_BORDER_COLOR,
-                &DWMWA_COLOR_NONE as *const u32 as *const std::ffi::c_void,
+                &frame_color as *const u32 as *const std::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR,
+                &frame_color as *const u32 as *const std::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TEXT_COLOR,
+                &text_color as *const u32 as *const std::ffi::c_void,
                 std::mem::size_of::<u32>() as u32,
             );
         }
@@ -150,7 +172,16 @@ fn apply_windows_window_frame<R: tauri::Runtime>(window: &tauri::WebviewWindow<R
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_windows_window_frame<R: tauri::Runtime>(_window: &tauri::WebviewWindow<R>) {}
+fn apply_windows_window_frame<R: tauri::Runtime>(
+    _window: &tauri::WebviewWindow<R>,
+    _is_dark: bool,
+) {
+}
+
+#[tauri::command]
+fn set_window_frame_theme(window: tauri::WebviewWindow, is_dark: bool) {
+    apply_windows_window_frame(&window, is_dark);
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2358,7 +2389,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                apply_windows_window_frame(&window);
+                apply_windows_window_frame(&window, false);
             }
             Ok(())
         })
@@ -2370,6 +2401,7 @@ pub fn run() {
             delete_local_entry,
             delete_sdcard_entry,
             get_cargo_package_version,
+            set_window_frame_theme,
             get_local_text_preview_meta,
             get_remote_text_preview_meta,
             list_adb_devices,

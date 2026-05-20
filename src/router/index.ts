@@ -32,9 +32,5 @@ export const router = createRouter({
       path: "/about",
       redirect: "/settings",
     },
-    {
-      path: "/help",
-      redirect: "/settings",
-    },
   ],
 });

@@ -3,7 +3,9 @@
   --font-code: "Cascadia Code", "Consolas", monospace;
   --text-main: #0f172a;
   --text-sub: #64748b;
+  --text-muted: #94a3b8;
   --surface: rgba(255, 255, 255, 0.9);
+  --surface-solid: #ffffff;
   --surface-alt: #f8fafc;
   --border: #d8e0ea;
   --control-border: #cbd5e1;
@@ -14,13 +16,64 @@
   --primary-hover: #1d4ed8;
   --primary-soft: #eff6ff;
   --primary-border: #93c5fd;
+  --primary-contrast: #ffffff;
   --danger: #dc2626;
+  --danger-soft: #fef2f2;
+  --danger-border: #fecaca;
+  --danger-text: #b91c1c;
   --success: #16a34a;
   --warn: #f59e0b;
   --shadow: 0 10px 30px rgba(15, 23, 42, 0.1);
   --app-window-bg: #f8fafc;
   --mirror-toolbar-bg: #f8fafc;
   --mirror-toolbar-border: #d8e0ea;
+  --page-bg: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+  --scrollbar-track: #f1f5f9;
+  --scrollbar-thumb: rgba(100, 116, 139, 0.28);
+  --scrollbar-thumb-hover: rgba(100, 116, 139, 0.42);
+  --dock-bg: rgb(248 250 252 / 0.96);
+  --dock-bg-soft: rgb(248 250 252 / 0.94);
+  --dock-border: rgb(148 163 184 / 0.32);
+  --kbd-shadow: inset 0 -1px 0 rgb(15 23 42 / 0.08), 0 1px 2px rgb(15 23 42 / 0.04);
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --text-main: #e5edf7;
+  --text-sub: #9aa9bd;
+  --text-muted: #718096;
+  --surface: rgba(17, 24, 39, 0.9);
+  --surface-solid: #111827;
+  --surface-alt: #0f172a;
+  --border: #263244;
+  --control-border: #334155;
+  --control-bg: #111827;
+  --control-bg-hover: #172033;
+  --control-text: #cbd5e1;
+  --primary: #60a5fa;
+  --primary-hover: #3b82f6;
+  --primary-soft: rgba(37, 99, 235, 0.2);
+  --primary-border: #2563eb;
+  --primary-contrast: #06111f;
+  --danger: #f87171;
+  --danger-soft: rgba(127, 29, 29, 0.24);
+  --danger-border: #7f1d1d;
+  --danger-text: #fecaca;
+  --success: #4ade80;
+  --warn: #facc15;
+  --shadow: 0 18px 42px rgba(0, 0, 0, 0.38);
+  --app-window-bg: #0b1120;
+  --mirror-toolbar-bg: #0b1120;
+  --mirror-toolbar-border: #243044;
+  --page-bg: linear-gradient(180deg, #0b1120 0%, #111827 100%);
+  --scrollbar-track: #111827;
+  --scrollbar-thumb: rgba(148, 163, 184, 0.28);
+  --scrollbar-thumb-hover: rgba(148, 163, 184, 0.44);
+  --dock-bg: rgb(15 23 42 / 0.96);
+  --dock-bg-soft: rgb(15 23 42 / 0.94);
+  --dock-border: rgb(71 85 105 / 0.72);
+  --kbd-shadow: inset 0 -1px 0 rgb(0 0 0 / 0.32), 0 1px 2px rgb(0 0 0 / 0.3);
+  color-scheme: dark;
 }
 
 * {
@@ -55,6 +108,16 @@ body {
   height: 100%;
 }
 
+body[data-theme="dark"]::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 2147483647;
+  height: 2px;
+  background: var(--mirror-toolbar-bg);
+  pointer-events: none;
+}
+
 html {
   background: var(--app-window-bg);
   width: 100%;
@@ -78,22 +141,22 @@ html.mirror-window-bg #app {
 }
 
 *::-webkit-scrollbar-track {
-  background: #f1f5f9;
+  background: var(--scrollbar-track);
 }
 
 *::-webkit-scrollbar-corner {
-  background: #f1f5f9;
+  background: var(--scrollbar-track);
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgba(100, 116, 139, 0.28);
+  background: var(--scrollbar-thumb);
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.42);
+  background: var(--scrollbar-thumb-hover);
   border: 2px solid transparent;
   background-clip: content-box;
 }
@@ -105,7 +168,7 @@ html.mirror-window-bg #app {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+  background: var(--page-bg);
   color: var(--text-main);
   font-family: var(--font-main);
 }
@@ -577,7 +640,7 @@ html.mirror-window-bg #app {
 }
 
 .card {
-  background: var(--surface);
+  background: var(--surface-solid);
   border: 0;
   border-radius: 0;
   box-shadow: none;
@@ -1555,6 +1618,56 @@ html.mirror-window-bg #app {
   color: var(--primary);
   padding: 6px 12px;
   box-shadow: var(--shadow);
+}
+
+:root[data-theme="dark"] .card,
+:root[data-theme="dark"] .topbar,
+:root[data-theme="dark"] .device-menu,
+:root[data-theme="dark"] .file-pane,
+:root[data-theme="dark"] .settings-tabbar,
+:root[data-theme="dark"] .settings-shortcut-item,
+:root[data-theme="dark"] .about-item,
+:root[data-theme="dark"] .mirror-tabbar,
+:root[data-theme="dark"] .command-picker-panel,
+:root[data-theme="dark"] .terminal-pane,
+:root[data-theme="dark"] .text-preview-head,
+:root[data-theme="dark"] .delete-confirm-dialog {
+  background: var(--surface-solid);
+  border-color: var(--border);
+  color: var(--text-main);
+}
+
+:root[data-theme="dark"] .input,
+:root[data-theme="dark"] input,
+:root[data-theme="dark"] textarea,
+:root[data-theme="dark"] select,
+:root[data-theme="dark"] .wifi-connect-input,
+:root[data-theme="dark"] .file-path-bar,
+:root[data-theme="dark"] .file-parent-row,
+:root[data-theme="dark"] .settings-shortcut-key,
+:root[data-theme="dark"] .settings-shortcut-reset,
+:root[data-theme="dark"] .screenshot-tool-btn {
+  background: var(--control-bg);
+  border-color: var(--control-border);
+  color: var(--control-text);
+}
+
+:root[data-theme="dark"] .device-option,
+:root[data-theme="dark"] .command-picker-item,
+:root[data-theme="dark"] .file-tree-item,
+:root[data-theme="dark"] .delete-confirm-path,
+:root[data-theme="dark"] .mirror-empty-shortcut-row,
+:root[data-theme="dark"] .about-item,
+:root[data-theme="dark"] .settings-shortcut-item {
+  background: var(--surface-alt);
+  border-color: var(--border);
+}
+
+:root[data-theme="dark"] .root-icon-btn-danger,
+:root[data-theme="dark"] .transfer-tool-btn.danger {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger-text);
 }
 
 @media (max-width: 1080px) {

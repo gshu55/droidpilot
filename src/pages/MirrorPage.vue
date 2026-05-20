@@ -10,6 +10,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { useAdbStore } from "../stores/adb";
 import { appShortcutDefinitions, appShortcutKeyParts, defaultAppShortcutMap, normalizeAppShortcutMap, type AppShortcut } from "../config/appShortcuts";
+import { useI18n } from "../i18n";
+import SettingsPage from "./SettingsPage.vue";
 
 interface AdbExecResult {
   success: boolean;
@@ -219,7 +221,8 @@ type WorkspaceTab =
   | { key: string; kind: "screenshot"; title: string; status: string; running: boolean; closable: boolean; editor: ImageEditorTab }
   | { key: string; kind: "textPreview"; title: string; status: string; running: boolean; closable: boolean }
   | { key: string; kind: "transfer"; title: string; status: string; running: boolean; closable: boolean }
-  | { key: string; kind: "terminal"; title: string; status: string; running: boolean; closable: boolean };
+  | { key: string; kind: "terminal"; title: string; status: string; running: boolean; closable: boolean }
+  | { key: string; kind: "settings"; title: string; status: string; running: boolean; closable: boolean };
 type MirrorToolbarAction =
   | "toggleMirror"
   | "back"
@@ -229,17 +232,11 @@ type MirrorToolbarAction =
   | "screenshot"
   | "record"
   | "transfer"
-  | "terminal";
-
-const homeShortcutLabels: Record<AppShortcut["action"], string> = {
-  mirror: "打开投屏",
-  transfer: "打开文件传输",
-  screenshot: "快速截图",
-  record: "开始 / 停止录制",
-  terminal: "打开终端",
-};
+  | "terminal"
+  | "settings";
 
 const adbStore = useAdbStore();
+const { t } = useI18n();
 const adbStoreRefs = storeToRefs(adbStore);
 const {
   selectedSerial,
@@ -314,6 +311,7 @@ const terminalStarting = ref(false);
 const terminalQuickGroup = ref<QuickCommandGroup>("common");
 const activeTerminalCommand = ref("");
 const terminalPanelOpen = ref(false);
+const settingsPanelOpen = ref(false);
 const commandPickerCollapsed = ref(false);
 const imageEditorTabs = ref<ImageEditorTab[]>([]);
 const activeMirrorTabId = ref(0);
@@ -421,8 +419,8 @@ const workspaceTabs = computed<WorkspaceTab[]>(() => {
     tabs.push({
       key: "text-preview",
       kind: "textPreview",
-      title: textPreviewMeta.value?.name || "文本预览",
-      status: textPreviewLoading.value ? "打开中" : "预览",
+      title: textPreviewMeta.value?.name || t("mirror.textPreview"),
+      status: textPreviewLoading.value ? t("mirror.opening") : t("common.preview"),
       running: textPreviewLoading.value,
       closable: true,
     });
@@ -431,8 +429,8 @@ const workspaceTabs = computed<WorkspaceTab[]>(() => {
     tabs.push({
       key: "transfer",
       kind: "transfer",
-      title: "文件传输",
-      status: transferRunning.value ? (copyDirection.value === "install" ? "安装中" : "传输中") : "就绪",
+      title: t("app.fileTransfer"),
+      status: transferRunning.value ? (copyDirection.value === "install" ? t("mirror.transferInstalling") : t("mirror.transferRunning")) : t("common.ready"),
       running: transferRunning.value,
       closable: !transferRunning.value,
     });
@@ -441,9 +439,19 @@ const workspaceTabs = computed<WorkspaceTab[]>(() => {
     tabs.push({
       key: "terminal",
       kind: "terminal",
-      title: "快捷终端",
-      status: terminalStarting.value ? "启动中" : terminalSessionId.value ? "已连接" : "已关闭",
+      title: t("app.terminal"),
+      status: terminalStarting.value ? t("mirror.terminalStarting") : terminalSessionId.value ? t("mirror.terminalConnected") : t("mirror.terminalClosed"),
       running: Boolean(terminalSessionId.value),
+      closable: true,
+    });
+  }
+  if (settingsPanelOpen.value) {
+    tabs.push({
+      key: "settings",
+      kind: "settings",
+      title: t("common.settings"),
+      status: t("mirror.tabSettingsStatus"),
+      running: false,
       closable: true,
     });
   }
@@ -638,21 +646,21 @@ const existingActiveMirrorTab = computed(() => {
 });
 const mirrorToggleLabel = computed(() => {
   if (!isActiveWorkspaceMirror.value) {
-    return existingActiveMirrorTab.value ? "打开投屏" : "开始投屏";
+    return existingActiveMirrorTab.value ? t("mirror.openMirror") : t("mirror.startMirror");
   }
   if (activeMirrorAutoRestarting.value) {
-    return "重连中";
+    return t("mirror.reconnecting");
   }
   if (state.value === "starting") {
-    return "取消启动";
+    return t("mirror.cancelStart");
   }
   if (state.value === "running" || state.value === "error") {
-    return "停止投屏";
+    return t("mirror.stopMirror");
   }
   if (state.value === "stopping") {
-    return "停止中";
+    return t("mirror.stopping");
   }
-  return "开始投屏";
+  return t("mirror.startMirror");
 });
 const isActiveWorkspaceMirror = computed(() => activeWorkspaceTabKey.value.startsWith("mirror:"));
 const activeMirrorRecording = computed(() => recording.value && recordingMirrorTabId.value === activeMirrorTab.value?.id);
@@ -713,21 +721,21 @@ function syncMirrorToolbarState() {
 function screenPlaceholderFor(tab: MirrorTab) {
   if (tab.state === "error") {
     return {
-      title: "投屏异常",
-      message: tab.statusText || "投屏连接失败，请检查设备和解码设置",
+      title: t("mirror.mirrorError"),
+      message: tab.statusText || t("mirror.mirrorConnectFailed"),
     };
   }
 
   if (!selectedSerial.value) {
     return {
-      title: "请选择设备",
-      message: "选择设备后点击开始投屏",
+      title: t("mirror.selectDevice"),
+      message: t("mirror.selectDeviceMessage"),
     };
   }
 
   return {
-    title: "等待启动",
-    message: tab.statusText === "已停止" ? "投屏已停止，可重新开始" : "点击开始投屏",
+    title: t("mirror.waitingStart"),
+    message: tab.statusText === "已停止" ? t("mirror.stoppedRestart") : t("mirror.clickStart"),
   };
 }
 
@@ -3009,7 +3017,23 @@ async function closeWorkspaceTab(tab: WorkspaceTab) {
     closeTextPreview();
     return;
   }
+  if (tab.kind === "settings") {
+    closeSettingsPanel();
+    return;
+  }
   await closeTerminalPanel();
+}
+
+function closeWorkspaceTabByMiddleClick(tab: WorkspaceTab, event: MouseEvent) {
+  if (event.button !== 1) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  if (!tab.closable) {
+    return;
+  }
+  void closeWorkspaceTab(tab);
 }
 
 function closeImageEditorTab(editor: ImageEditorTab) {
@@ -3836,6 +3860,16 @@ function openTerminalPanel() {
   });
 }
 
+function openSettingsPanel() {
+  const wasOpen = settingsPanelOpen.value;
+  settingsPanelOpen.value = true;
+  if (!wasOpen) {
+    registerWorkspaceTab("settings");
+  }
+  activeWorkspaceTabKey.value = "settings";
+  scrollWorkspaceTabIntoView("settings");
+}
+
 function handleMirrorToolbarAction(event: Event) {
   const action = (event as CustomEvent<MirrorToolbarAction>).detail;
   switch (action) {
@@ -3869,6 +3903,9 @@ function handleMirrorToolbarAction(event: Event) {
       break;
     case "terminal":
       openTerminalPanel();
+      break;
+    case "settings":
+      openSettingsPanel();
       break;
   }
 }
@@ -3907,6 +3944,16 @@ async function closeTerminalPanel() {
   disposeTerminalView();
   if (wasActive) {
     activateAdjacentWorkspaceTabAfterClose("terminal", previousOrder);
+  }
+}
+
+function closeSettingsPanel() {
+  const wasActive = activeWorkspaceTabKey.value === "settings";
+  const previousOrder = [...workspaceTabOrder.value];
+  settingsPanelOpen.value = false;
+  unregisterWorkspaceTab("settings");
+  if (wasActive) {
+    activateAdjacentWorkspaceTabAfterClose("settings", previousOrder);
   }
 }
 
@@ -5331,6 +5378,8 @@ onBeforeUnmount(() => {
             class="mirror-tab"
             :data-tab-key="tab.key"
             :class="{ active: tab.key === activeWorkspaceTabKey, running: tab.running, tool: tab.kind !== 'mirror' }"
+            @mousedown.middle.prevent
+            @auxclick="closeWorkspaceTabByMiddleClick(tab, $event)"
           >
             <button class="mirror-tab-main" type="button" @click="activateWorkspaceTab(tab)">
               <span>{{ tab.title }}</span>
@@ -5353,7 +5402,7 @@ onBeforeUnmount(() => {
       <div class="mirror-screen-stack" :class="{ empty: workspaceTabs.length === 0 }">
         <section v-if="workspaceTabs.length === 0" class="mirror-empty-shortcuts" aria-label="快捷键">
           <div v-for="shortcut in appShortcutDefinitions" :key="shortcut.action" class="mirror-empty-shortcut-row">
-            <span>{{ homeShortcutLabels[shortcut.action] }}</span>
+            <span>{{ t(`shortcuts.${shortcut.action}.home`) }}</span>
             <div class="mirror-empty-shortcut-keys" aria-hidden="true">
               <template v-for="(part, index) in homeShortcutKeyParts(shortcut)" :key="`${shortcut.action}-${part}-${index}`">
                 <kbd>{{ part }}</kbd>
@@ -5586,7 +5635,7 @@ onBeforeUnmount(() => {
               <span>{{ terminalShell || "终端" }}</span>
             </div>
             <div class="terminal-toolbar-right">
-              <span>{{ terminalStarting ? "启动中" : terminalSessionId ? "已连接" : "已关闭" }}</span>
+              <span>{{ terminalStarting ? t("mirror.terminalStarting") : terminalSessionId ? t("mirror.terminalConnected") : t("mirror.terminalClosed") }}</span>
             </div>
           </div>
           <div ref="terminalHostRef" class="terminal-host"></div>
@@ -5718,6 +5767,10 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <section v-if="settingsPanelOpen" v-show="activeWorkspaceTabKey === 'settings'" class="settings-dock">
+        <SettingsPage />
+      </section>
+
       <section
         v-if="textPreviewOpen"
         v-show="activeWorkspaceTabKey === 'text-preview'"
@@ -5726,7 +5779,7 @@ onBeforeUnmount(() => {
       >
         <header class="text-preview-head">
           <div>
-            <strong>{{ textPreviewMeta?.name || "文本预览" }}</strong>
+            <strong>{{ textPreviewMeta?.name || t("mirror.textPreview") }}</strong>
             <span>{{ textPreviewSource === "local" ? "系统文件" : "设备文件" }} · {{ textPreviewMeta ? formatBytes(textPreviewMeta.sizeBytes) : "读取中" }}</span>
           </div>
           <div class="text-preview-actions">
@@ -5949,12 +6002,24 @@ onBeforeUnmount(() => {
   grid-template-rows: minmax(0, 1fr);
   gap: 0;
   min-height: 0;
-  border: 1px solid rgb(148 163 184 / 0.32);
+  border: 1px solid var(--dock-border);
   border-radius: 8px;
-  background: rgb(248 250 252 / 0.96);
+  background: var(--dock-bg);
   box-shadow: none;
   padding: 8px;
   backdrop-filter: none;
+}
+
+.settings-dock {
+  position: absolute;
+  inset: 50px 8px 8px;
+  z-index: 5;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--dock-border);
+  border-radius: 8px;
+  background: var(--dock-bg);
 }
 
 .transfer-modal-body {
@@ -5973,9 +6038,9 @@ onBeforeUnmount(() => {
   grid-template-columns: minmax(210px, 250px) minmax(0, 1fr);
   gap: 10px;
   min-height: 0;
-  border: 1px solid rgb(148 163 184 / 0.32);
+  border: 1px solid var(--dock-border);
   border-radius: 8px;
-  background: rgb(248 250 252 / 0.94);
+  background: var(--dock-bg-soft);
   box-shadow: none;
   padding: 8px;
   backdrop-filter: none;
@@ -5992,9 +6057,9 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-rows: max-content minmax(0, 1fr);
   min-height: 0;
-  border: 1px solid rgb(148 163 184 / 0.32);
+  border: 1px solid var(--dock-border);
   border-radius: 8px;
-  background: rgb(248 250 252 / 0.96);
+  background: var(--dock-bg);
   padding: 8px;
 }
 
@@ -6024,10 +6089,10 @@ onBeforeUnmount(() => {
 .screenshot-tool-btn {
   flex: 0 0 auto;
   height: 30px;
-  border: 1px solid #dbe3ef;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: #fff;
-  color: #334155;
+  background: var(--control-bg);
+  color: var(--control-text);
   cursor: pointer;
 }
 
@@ -7080,7 +7145,7 @@ onBeforeUnmount(() => {
   min-height: 0;
   border: 0;
   border-radius: 0;
-  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  background: var(--page-bg);
   padding: 0;
   overflow: hidden;
   box-shadow: none;
@@ -7099,7 +7164,7 @@ onBeforeUnmount(() => {
   height: 42px;
   min-height: 42px;
   border-bottom: 1px solid var(--border);
-  background: #ffffff;
+  background: var(--surface-solid);
   padding: 6px 8px;
   box-shadow: 0 1px 0 rgb(15 23 42 / 0.06);
 }
@@ -7225,7 +7290,7 @@ onBeforeUnmount(() => {
   transform: translate(-50%, -50%);
   gap: 12px;
   padding: 2px;
-  color: #334155;
+  color: var(--control-text);
 }
 
 .mirror-empty-shortcut-row {
@@ -7237,7 +7302,7 @@ onBeforeUnmount(() => {
 }
 
 .mirror-empty-shortcut-row span {
-  color: #475569;
+  color: var(--text-sub);
   font-size: 14px;
   line-height: 1.3;
   white-space: nowrap;
@@ -7257,18 +7322,18 @@ onBeforeUnmount(() => {
   min-width: 32px;
   height: 24px;
   padding: 0 8px;
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--control-border);
   border-radius: 5px;
-  background: #ffffff;
-  color: #0f172a;
-  box-shadow: inset 0 -1px 0 rgb(15 23 42 / 0.08), 0 1px 2px rgb(15 23 42 / 0.04);
+  background: var(--control-bg);
+  color: var(--text-main);
+  box-shadow: var(--kbd-shadow);
   font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
   font-size: 12px;
   line-height: 1;
 }
 
 .mirror-empty-shortcut-keys em {
-  color: #94a3b8;
+  color: var(--text-muted);
   font-style: normal;
   font-size: 12px;
   line-height: 1;
@@ -7285,7 +7350,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
   border: 0;
   border-radius: 0;
-  background: #f1f5f9;
+  background: var(--surface-alt);
   touch-action: none;
   cursor: default;
   user-select: none;
@@ -7302,7 +7367,7 @@ onBeforeUnmount(() => {
   max-height: 100%;
   width: auto;
   height: auto;
-  background: #f1f5f9;
+  background: var(--surface-alt);
   image-rendering: auto;
   user-select: none;
   -webkit-user-select: none;

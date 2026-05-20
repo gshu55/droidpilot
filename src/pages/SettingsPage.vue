@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { RouterLink } from "vue-router";
 import { storeToRefs } from "pinia";
 import { downloadDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  type AppLanguage,
+  type AppTheme,
   type MirrorToolbarSide,
   type PickerCopyFormat,
   type ScreenshotMode,
@@ -19,16 +20,19 @@ import {
   normalizeAppShortcutMap,
   type AppShortcutAction,
 } from "../config/appShortcuts";
+import { appLanguageOptions, appThemeOptions, useI18n } from "../i18n";
 import AboutPage from "./AboutPage.vue";
-import HelpPage from "./HelpPage.vue";
 
-type SettingsSection = "preferences" | "shortcuts" | "help" | "about";
-type SettingsIconName = "arrowLeft" | "preferences" | "shortcuts" | "help" | "about" | "folder";
+type SettingsSection = "preferences" | "shortcuts" | "about";
+type SettingsIconName = "preferences" | "shortcuts" | "about" | "folder";
 
 const adbStore = useAdbStore();
+const { t } = useI18n();
 const activeSection = ref<SettingsSection>("preferences");
 const adbStoreRefs = storeToRefs(adbStore);
 const {
+  language,
+  theme,
   defaultLocalDir,
   defaultDevicePath,
   screenshotMode,
@@ -43,37 +47,36 @@ const shortcutRows = computed(() =>
     const value = configuredAppShortcuts.value[shortcut.action] || defaultAppShortcutMap[shortcut.action];
     return {
       ...shortcut,
+      label: t(`shortcuts.${shortcut.action}.label`),
+      description: t(`shortcuts.${shortcut.action}.description`),
       value,
       displayValue: displayAppShortcutValue(value) || displayAppShortcutValue(shortcut.defaultValue),
     };
   }),
 );
 
-const settingsSections: Array<{ key: SettingsSection; title: string; icon: SettingsIconName }> = [
-  { key: "preferences", title: "偏好设置", icon: "preferences" },
-  { key: "shortcuts", title: "快捷键", icon: "shortcuts" },
-  { key: "help", title: "帮助", icon: "help" },
-  { key: "about", title: "关于", icon: "about" },
+const settingsSections: Array<{ key: SettingsSection; titleKey: string; icon: SettingsIconName }> = [
+  { key: "preferences", titleKey: "common.preferences", icon: "preferences" },
+  { key: "shortcuts", titleKey: "common.shortcuts", icon: "shortcuts" },
+  { key: "about", titleKey: "common.about", icon: "about" },
 ];
 
 const settingsIconPaths: Record<SettingsIconName, string[]> = {
-  arrowLeft: ["M19 12H5", "M12 19l-7-7 7-7"],
   preferences: ["M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z", "M19.4 15a1.8 1.8 0 0 0 .4 2l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.8 1.8 0 0 0-2-.4 1.8 1.8 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.8 1.8 0 0 0-1-1.6 1.8 1.8 0 0 0-2 .4l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.8 1.8 0 0 0 .4-2 1.8 1.8 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.8 1.8 0 0 0 1.6-1 1.8 1.8 0 0 0-.4-2l-.1-.1A2 2 0 1 1 7 4.1l.1.1a1.8 1.8 0 0 0 2 .4 1.8 1.8 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.8 1.8 0 0 0 1 1.6 1.8 1.8 0 0 0 2-.4l.1-.1A2 2 0 1 1 20 7l-.1.1a1.8 1.8 0 0 0-.4 2 1.8 1.8 0 0 0 1.6 1h.1a2 2 0 1 1 0 4h-.1a1.8 1.8 0 0 0-1.7 1z"],
   shortcuts: ["M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z", "M6 9h.01", "M10 9h.01", "M14 9h.01", "M18 9h.01", "M7 13h10", "M9 16h6"],
-  help: ["M9.1 9a3 3 0 1 1 5.8 1c-.6 1.1-1.9 1.5-2.4 2.5", "M12 17h.01", "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"],
   about: ["M12 16v-4", "M12 8h.01", "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"],
   folder: ["M3 7h6l2 2h10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z", "M3 7V5a2 2 0 0 1 2-2h4l2 2h5"],
 };
 
 const screenshotModeOptions: Array<{ value: ScreenshotMode; label: string }> = [
-  { value: "save", label: "仅传输" },
-  { value: "copy", label: "仅复制" },
-  { value: "save-copy", label: "传输 + 复制" },
+  { value: "save", label: "settings.screenshotModeSave" },
+  { value: "copy", label: "settings.screenshotModeCopy" },
+  { value: "save-copy", label: "settings.screenshotModeSaveCopy" },
 ];
 
 const screenshotSourceOptions: Array<{ value: ScreenshotSource; label: string }> = [
-  { value: "native", label: "按原生截图" },
-  { value: "mirror", label: "按投屏截图" },
+  { value: "native", label: "settings.screenshotSourceNative" },
+  { value: "mirror", label: "settings.screenshotSourceMirror" },
 ];
 
 const pickerCopyFormatOptions: Array<{ value: PickerCopyFormat; label: string }> = [
@@ -82,15 +85,15 @@ const pickerCopyFormatOptions: Array<{ value: PickerCopyFormat; label: string }>
 ];
 
 const mirrorToolbarSideOptions: Array<{ value: MirrorToolbarSide; label: string }> = [
-  { value: "right", label: "右侧" },
-  { value: "left", label: "左侧" },
+  { value: "right", label: "settings.toolbarRight" },
+  { value: "left", label: "settings.toolbarLeft" },
 ];
 
 async function pickDownloadDir() {
   const selected = await open({
     directory: true,
     multiple: false,
-    title: "选择默认本地保存目录",
+    title: t("settings.pickDirTitle"),
   });
 
   if (typeof selected === "string") {
@@ -111,6 +114,14 @@ async function fillSystemDownloadDir() {
 
 function updateDefaultDevicePath(value: string) {
   adbStore.setDefaultDevicePath(value);
+}
+
+function updateLanguage(value: string) {
+  adbStore.setLanguage(value as AppLanguage);
+}
+
+function updateTheme(value: string) {
+  adbStore.setTheme(value as AppTheme);
 }
 
 function shortcutValue(action: AppShortcutAction) {
@@ -141,7 +152,7 @@ function onShortcutCapture(event: KeyboardEvent, action: AppShortcutAction) {
 
   const duplicate = appShortcutDefinitions.find((item) => item.action !== action && shortcutValue(item.action) === nextShortcut);
   if (duplicate) {
-    adbStore.setNotice("error", `快捷键已被「${duplicate.label}」使用`);
+    adbStore.setNotice("error", t("settings.duplicateShortcut", { label: t(`shortcuts.${duplicate.action}.label`) }));
     return;
   }
 
@@ -165,56 +176,81 @@ onMounted(async () => {
 
 <template>
   <div class="settings-layout">
-    <aside class="settings-sidebar">
-      <RouterLink class="settings-nav-item settings-back-link" to="/mirror" aria-label="返回投屏" title="返回投屏">
-        <svg class="settings-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
-          <path v-for="path in settingsIconPaths.arrowLeft" :key="path" :d="path" />
-        </svg>
-        <div class="back">返回</div>
-      </RouterLink>
-
-      <button
-        v-for="item in settingsSections"
-        :key="item.key"
-        type="button"
-        class="settings-nav-item"
-        :class="{ active: activeSection === item.key }"
-        @click="activeSection = item.key"
-      >
-        <svg class="settings-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
-          <path v-for="path in settingsIconPaths[item.icon]" :key="path" :d="path" />
-        </svg>
-        <strong>{{ item.title }}</strong>
-      </button>
-    </aside>
+    <nav class="settings-tabbar" aria-label="设置分类">
+      <div class="settings-tab-list">
+        <button
+          v-for="item in settingsSections"
+          :key="item.key"
+          type="button"
+          class="settings-tab"
+          :class="{ active: activeSection === item.key }"
+          @click="activeSection = item.key"
+        >
+          <svg class="settings-tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path v-for="path in settingsIconPaths[item.icon]" :key="path" :d="path" />
+          </svg>
+          <span>{{ t(item.titleKey) }}</span>
+        </button>
+      </div>
+    </nav>
 
     <section class="settings-content">
       <div v-if="activeSection === 'preferences'" class="settings-panel">
         <header class="settings-head">
-          <h4>偏好设置</h4>
+          <h4>{{ t("common.preferences") }}</h4>
         </header>
 
         <div class="settings-grid">
           <label>
-            <span>默认本地保存目录</span>
+            <span>{{ t("settings.language") }}</span>
+            <div class="segmented-control two compact language-control">
+              <button
+                v-for="item in appLanguageOptions"
+                :key="item.value"
+                type="button"
+                :class="{ active: language === item.value }"
+                @click="updateLanguage(item.value)"
+              >
+                {{ item.label }}
+              </button>
+            </div>
+          </label>
+
+          <label>
+            <span>{{ t("settings.theme") }}</span>
+            <div class="segmented-control theme-control">
+              <button
+                v-for="item in appThemeOptions"
+                :key="item.value"
+                type="button"
+                :class="{ active: theme === item.value }"
+                @click="updateTheme(item.value)"
+              >
+                {{ t(item.labelKey) }}
+              </button>
+            </div>
+          </label>
+
+          <label>
+            <span>{{ t("settings.defaultLocalDir") }}</span>
             <div class="field-row">
               <input
                 class="input mono"
                 :value="defaultLocalDir"
-                placeholder="截图、录屏、获取文件保存目录"
+                :placeholder="t('settings.defaultLocalDirPlaceholder')"
                 @input="adbStore.setDefaultLocalDir(($event.target as HTMLInputElement).value)"
               />
-              <button class="settings-icon-btn" type="button" title="选择默认本地保存目录" aria-label="选择默认本地保存目录" @click="pickDownloadDir">
+              <button class="settings-icon-btn" type="button" :title="t('settings.chooseDefaultLocalDir')" :aria-label="t('settings.chooseDefaultLocalDir')" @click="pickDownloadDir">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path v-for="path in settingsIconPaths.folder" :key="path" :d="path" />
                 </svg>
               </button>
             </div>
-            <small class="field-note">截图和视频录制会直接存储到本机此目录。</small>
+            <small class="field-note">{{ t("settings.defaultLocalDirNote") }}</small>
           </label>
 
           <label>
-            <span>默认设备路径</span>
+            <span>{{ t("settings.defaultDevicePath") }}</span>
             <input
               class="input mono"
               :value="defaultDevicePath"
@@ -224,7 +260,7 @@ onMounted(async () => {
           </label>
 
           <label>
-            <span>截图处理方式</span>
+            <span>{{ t("settings.screenshotMode") }}</span>
             <div class="segmented-control">
               <button
                 v-for="item in screenshotModeOptions"
@@ -233,13 +269,13 @@ onMounted(async () => {
                 :class="{ active: screenshotMode === item.value }"
                 @click="adbStore.setScreenshotMode(item.value)"
               >
-                {{ item.label }}
+                {{ t(item.label) }}
               </button>
             </div>
           </label>
 
           <label>
-            <span>截图来源</span>
+            <span>{{ t("settings.screenshotSource") }}</span>
             <div class="segmented-control two">
               <button
                 v-for="item in screenshotSourceOptions"
@@ -248,14 +284,14 @@ onMounted(async () => {
                 :class="{ active: screenshotSource === item.value }"
                 @click="adbStore.setScreenshotSource(item.value)"
               >
-                {{ item.label }}
+                {{ t(item.label) }}
               </button>
             </div>
-            <small class="field-note">原生截图通过设备 screencap 获取；投屏截图截取当前标签页中的投屏画面。</small>
+            <small class="field-note">{{ t("settings.screenshotSourceNote") }}</small>
           </label>
 
           <label>
-            <span>取色复制</span>
+            <span>{{ t("settings.pickerCopy") }}</span>
             <div class="segmented-control two compact">
               <button
                 v-for="item in pickerCopyFormatOptions"
@@ -267,11 +303,11 @@ onMounted(async () => {
                 {{ item.label }}
               </button>
             </div>
-            <small class="field-note">截图编辑页取色器悬停时按 C 复制，按 Shift 快速切换 HEX/RGB。</small>
+            <small class="field-note">{{ t("settings.pickerCopyNote") }}</small>
           </label>
 
           <label>
-            <span>侧边栏位置</span>
+            <span>{{ t("settings.toolbarSide") }}</span>
             <div class="segmented-control two">
               <button
                 v-for="item in mirrorToolbarSideOptions"
@@ -280,7 +316,7 @@ onMounted(async () => {
                 :class="{ active: mirrorToolbarSide === item.value }"
                 @click="adbStore.setMirrorToolbarSide(item.value)"
               >
-                {{ item.label }}
+                {{ t(item.label) }}
               </button>
             </div>
           </label>
@@ -289,11 +325,11 @@ onMounted(async () => {
 
       <div v-else-if="activeSection === 'shortcuts'" class="settings-panel shortcuts-panel">
         <header class="settings-head">
-          <h4>快捷键</h4>
-          <p>应用窗口获得焦点时生效，不注册系统全局热键；快捷键需包含 Ctrl、Alt 或 Win。</p>
+          <h4>{{ t("common.shortcuts") }}</h4>
+          <p>{{ t("settings.shortcutsNote") }}</p>
         </header>
 
-        <section class="settings-shortcuts" aria-label="快捷键">
+        <section class="settings-shortcuts" :aria-label="t('common.shortcuts')">
           <div class="settings-shortcut-list">
             <div v-for="shortcut in shortcutRows" :key="shortcut.action" class="settings-shortcut-item">
               <div>
@@ -304,14 +340,14 @@ onMounted(async () => {
                 class="settings-shortcut-key"
                 type="button"
                 :class="{ capturing: capturingShortcutAction === shortcut.action }"
-                :aria-label="`修改${shortcut.label}快捷键`"
-                :title="capturingShortcutAction === shortcut.action ? '按下新的快捷键，Esc 取消' : '点击后按下新的快捷键'"
+                :aria-label="t('settings.shortcutChangeAria', { label: shortcut.label })"
+                :title="capturingShortcutAction === shortcut.action ? t('settings.shortcutCapturingTitle') : t('settings.shortcutChangeTitle')"
                 @click="beginShortcutCapture(shortcut.action)"
                 @keydown="onShortcutCapture($event, shortcut.action)"
               >
-                {{ capturingShortcutAction === shortcut.action ? "按下快捷键" : shortcut.displayValue }}
+                {{ capturingShortcutAction === shortcut.action ? t("settings.shortcutCapture") : shortcut.displayValue }}
               </button>
-              <button class="settings-shortcut-reset" type="button" title="恢复默认快捷键" aria-label="恢复默认快捷键" @click="resetShortcut(shortcut.action)">
+              <button class="settings-shortcut-reset" type="button" :title="t('settings.shortcutReset')" :aria-label="t('settings.shortcutReset')" @click="resetShortcut(shortcut.action)">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M3 12a9 9 0 1 0 2.6-6.4" />
                   <path d="M3 4v6h6" />
@@ -322,7 +358,6 @@ onMounted(async () => {
         </section>
       </div>
 
-      <HelpPage v-else-if="activeSection === 'help'" />
       <AboutPage v-else />
     </section>
   </div>
@@ -331,66 +366,79 @@ onMounted(async () => {
 <style scoped>
 .settings-layout {
   display: grid;
-  grid-template-columns: 148px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
   min-height: 0;
   overflow: hidden;
 }
 
-.settings-sidebar {
-  display: grid;
-  align-content: start;
-  align-self: stretch;
-  gap: 4px;
-  padding: 8px;
-  background: #f8fafc;
-  overflow: hidden;
-}
-
-.settings-nav-item {
+.settings-tabbar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  width: 100%;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
+  min-width: 0;
+  height: 42px;
+  min-height: 42px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-solid);
+  padding: 6px 8px;
+  box-shadow: 0 1px 0 rgb(15 23 42 / 0.06);
+}
+
+.settings-tab-list {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.settings-tab-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.settings-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  flex: 0 0 124px;
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+  background: var(--control-bg);
   color: var(--control-text);
-  padding: 8px 10px;
-  text-align: left;
-  text-decoration: none;
+  padding: 0 12px;
   cursor: pointer;
+  font: inherit;
   user-select: none;
   -webkit-user-select: none;
 }
 
-.settings-nav-item:hover,
-.settings-nav-item.active {
+.settings-tab:hover,
+.settings-tab.active {
+  border-color: var(--primary-border);
   background: var(--primary-soft);
   color: var(--primary);
 }
 
-.settings-nav-item strong {
-  font-size: 16px;
-  font-weight: 400;
+.settings-tab span {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.settings-nav-item .back {
-  font-size: 16px;
-  font-weight: 400;
-  color: #7F7F7F;
-}
-
-.settings-back-link {
-  margin-bottom: 10px;
-  color: var(--text-muted);
-}
-
-.settings-back-link:hover {
-  color: var(--control-text);
-}
-
-.settings-nav-icon {
+.settings-tab-icon {
   width: 15px;
   height: 15px;
   flex: 0 0 auto;
@@ -399,7 +447,6 @@ onMounted(async () => {
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
-  color: #7F7F7F;
 }
 
 .settings-content {
@@ -516,6 +563,14 @@ onMounted(async () => {
   width: 132px;
 }
 
+.language-control {
+  width: 180px;
+}
+
+.theme-control {
+  width: min(360px, 100%);
+}
+
 .segmented-control button {
   height: 32px;
   border: 0;
@@ -533,7 +588,7 @@ onMounted(async () => {
 
 .segmented-control button.active {
   background: var(--primary);
-  color: #fff;
+  color: var(--primary-contrast);
 }
 
 .segmented-control button:hover:not(.active) {
@@ -569,9 +624,9 @@ onMounted(async () => {
   gap: 10px;
   min-height: 38px;
   padding: 7px 8px 7px 10px;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--surface-solid);
 }
 
 .settings-shortcut-item div {
@@ -596,8 +651,8 @@ onMounted(async () => {
 .settings-shortcut-reset {
   border: 1px solid #cbd5e1;
   border-radius: 6px;
-  background: #f1f5f9;
-  color: #0f172a;
+  background: var(--control-bg-hover);
+  color: var(--text-main);
   cursor: pointer;
 }
 
@@ -642,7 +697,6 @@ onMounted(async () => {
   stroke-linejoin: round;
 }
 
-:deep(.help-page),
 :deep(.about-page) {
   margin: 0;
   border: 0;
@@ -650,12 +704,10 @@ onMounted(async () => {
   box-shadow: none;
 }
 
-:deep(.help-page.panel),
 :deep(.about-page.panel) {
   padding: 12px;
 }
 
-:deep(.help-page h2),
 :deep(.about-page h2) {
   margin: 0 0 8px;
   color: var(--text-main);
@@ -664,24 +716,13 @@ onMounted(async () => {
   line-height: 1.25;
 }
 
-:deep(.help-section),
 :deep(.about-item) {
-  background: #f8fafc;
+  background: var(--surface-alt);
 }
 
 @media (max-width: 700px) {
-  .settings-layout {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
-  }
-
-  .settings-sidebar {
-    grid-auto-flow: column;
-    grid-auto-columns: max-content;
-    overflow-x: auto;
-    overflow-y: hidden;
-    border-right: 0;
-    border-bottom: 0;
+  .settings-tab {
+    flex-basis: 104px;
   }
 
   .field-row,
