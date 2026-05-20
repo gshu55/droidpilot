@@ -699,6 +699,11 @@ fn is_device_storage_root(path: &str) -> bool {
 }
 
 #[tauri::command]
+fn get_cargo_package_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[tauri::command]
 async fn transfer_file(
     app: tauri::AppHandle,
     request: TransferRequest,
@@ -2364,6 +2369,7 @@ pub fn run() {
             capture_device_screenshot,
             delete_local_entry,
             delete_sdcard_entry,
+            get_cargo_package_version,
             get_local_text_preview_meta,
             get_remote_text_preview_meta,
             list_adb_devices,

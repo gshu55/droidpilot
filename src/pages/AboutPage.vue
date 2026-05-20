@@ -1,3 +1,34 @@
+<script setup lang="ts">
+import { getTauriVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
+import { onMounted, ref } from "vue";
+
+const appVersion = ref(__APP_VERSION__);
+const tauriVersion = ref("读取中");
+
+onMounted(async () => {
+  try {
+    const version = await invoke<string>("get_cargo_package_version");
+
+    if (version.trim()) {
+      appVersion.value = version;
+    }
+  } catch {
+    appVersion.value = __APP_VERSION__;
+  }
+
+  try {
+    const version = await getTauriVersion();
+
+    if (version.trim()) {
+      tauriVersion.value = version;
+    }
+  } catch {
+    tauriVersion.value = "不可用";
+  }
+});
+</script>
+
 <template>
   <section class="card panel about-page">
     <h4>关于</h4>
@@ -15,7 +46,8 @@
       <article class="about-item">
         <h3>版本信息</h3>
         <ul>
-          <li>应用版本：1.0.2</li>
+          <li>应用版本：{{ appVersion }}</li>
+          <li>Tauri 版本：{{ tauriVersion }}</li>
           <li>发布日期：2026-05-11</li>
           <li>数据处理：本地优先，不提供云同步服务</li>
         </ul>

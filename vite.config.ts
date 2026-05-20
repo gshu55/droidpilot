@@ -1,12 +1,18 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import { readFileSync } from "node:fs";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+const cargoToml = readFileSync(new URL("./src-tauri/Cargo.toml", import.meta.url), "utf-8");
+const cargoPackageVersion = cargoToml.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1];
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [vue()],
+  define: {
+    __APP_VERSION__: JSON.stringify(cargoPackageVersion ?? "unknown"),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
