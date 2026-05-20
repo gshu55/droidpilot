@@ -9,3 +9,5 @@ Thumbs.db
 
 src-tauri/gen/
 src-tauri/.tauri/
+
+*-lock.json

@@ -224,7 +224,20 @@ function closeDropdown() {
   dropdownOpen.value = false;
 }
 
+function sanitizeWifiAddressInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const sanitized = input.value.replace(/[^\d.:]/g, "");
+  if (input.value !== sanitized) {
+    input.value = sanitized;
+  }
+  wifiAddress.value = sanitized;
+}
+
 async function connectWifiAdb() {
+  if (wifiConnecting.value) {
+    return;
+  }
+
   const target = wifiAddress.value.trim();
   if (!target) {
     adbStore.setNotice("error", "请输入 IP:端口，例如 192.168.1.100:5555");
@@ -515,6 +528,9 @@ watch(isMirrorRoute, syncResizeBackground, { immediate: true });
                   class="wifi-connect-input mono"
                   v-model="wifiAddress"
                   placeholder="192.168.1.100:5555"
+                  inputmode="decimal"
+                  pattern="[0-9.:]*"
+                  @input="sanitizeWifiAddressInput"
                   @keydown.enter.prevent="connectWifiAdb"
                 />
                 <button
