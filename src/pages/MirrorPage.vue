@@ -13,6 +13,12 @@ import { appShortcutDefinitions, appShortcutKeyParts, defaultAppShortcutMap, nor
 import { useI18n } from "../i18n";
 import SettingsPage from "./SettingsPage.vue";
 
+const SYNTHETIC_PINCH_POINTER_A = 100_000;
+const SYNTHETIC_PINCH_POINTER_B = 100_001;
+const SYNTHETIC_PAN_POINTER_A = 100_002;
+const SYNTHETIC_PAN_POINTER_B = 100_003;
+const SYNTHETIC_PINCH_END_DELAY_MS = 180;
+
 interface AdbExecResult {
   success: boolean;
   statusCode: number;
@@ -127,6 +133,19 @@ type MirrorState = "idle" | "starting" | "running" | "stopping" | "error";
 type DeleteConfirmTarget = { scope: "local" | "remote"; path: string } | null;
 type QuickCommandGroup = "common" | "device" | "screen" | "media";
 type QuickCommandItem = { label: string; command: string; desc: string; group: QuickCommandGroup; tag?: string };
+type TouchPoint = { x: number; y: number };
+interface SyntheticTouchGesture {
+  active: boolean;
+  center: TouchPoint;
+  distance: number;
+  finishTimer: ReturnType<typeof window.setTimeout> | null;
+}
+interface SyntheticPanGesture {
+  active: boolean;
+  sourcePointerId: number | null;
+  center: TouchPoint;
+  distance: number;
+}
 interface MirrorTab {
   id: number;
   title: string;
@@ -146,8 +165,10 @@ interface MirrorTab {
   configuredCodec: string;
   latestConfigPacket: Uint8Array | null;
   pendingConfigPacket: Uint8Array | null;
-  pointerActive: boolean;
-  lastMoveAt: number;
+  activePointers: Map<number, number>;
+  syntheticPinch: SyntheticTouchGesture;
+  syntheticPan: SyntheticPanGesture;
+  lastMoveAt: Map<number, number>;
 }
 type ImageEditorTool = "crop" | "rect" | "arrow" | "polyline" | "mosaic" | "text" | "eraser" | "picker";
 type ImageEditorShape =
@@ -385,8 +406,20 @@ function createMirrorTab(id = nextMirrorTabId++): MirrorTab {
     configuredCodec: "avc1.42E01F",
     latestConfigPacket: null,
     pendingConfigPacket: null,
-    pointerActive: false,
-    lastMoveAt: 0,
+    activePointers: new Map(),
+    syntheticPinch: {
+      active: false,
+      center: { x: 0, y: 0 },
+      distance: 0,
+      finishTimer: null,
+    },
+    syntheticPan: {
+      active: false,
+      sourcePointerId: null,
+      center: { x: 0, y: 0 },
+      distance: 0,
+    },
+    lastMoveAt: new Map(),
   };
 }
 
@@ -2884,7 +2917,7 @@ function cancelMirrorStart(tab: MirrorTab, message = "已取消启动") {
   tab.latestConfigPacket = null;
   tab.pendingConfigPacket = null;
   closeDecoder(tab);
-  tab.pointerActive = false;
+  clearActiveTouches(tab);
   setState(tab, "idle", message);
 }
 
@@ -3377,7 +3410,7 @@ function handleStatus(payload: ScrcpyStatusPayload) {
     tab.session = null;
     tab.latestConfigPacket = null;
     tab.pendingConfigPacket = null;
-    tab.pointerActive = false;
+    clearActiveTouches(tab);
     closeDecoder(tab);
     setState(tab, "idle", payload.message || "已停止");
     return;
@@ -3389,7 +3422,7 @@ function handleStatus(payload: ScrcpyStatusPayload) {
     tab.session = null;
     tab.latestConfigPacket = null;
     tab.pendingConfigPacket = null;
-    tab.pointerActive = false;
+    clearActiveTouches(tab);
     closeDecoder(tab);
     setState(tab, "error", payload.message || "投屏连接失败");
   }
@@ -3492,7 +3525,7 @@ async function restartMirrorOnceAfterDelay(tab: MirrorTab, startToken: number, s
   tab.latestConfigPacket = null;
   tab.pendingConfigPacket = null;
   closeDecoder(tab);
-  tab.pointerActive = false;
+  clearActiveTouches(tab);
   setState(tab, "starting", "正在重建投屏连接...");
 
   try {
@@ -3674,7 +3707,7 @@ async function stopMirror(tab = activeMirrorTab.value) {
     tab.pendingConfigPacket = null;
     tab.autoRestarting = false;
     closeDecoder(tab);
-    tab.pointerActive = false;
+    clearActiveTouches(tab);
     setState(tab, "idle", "已停止");
   }
 }
@@ -3720,7 +3753,7 @@ async function toggleMirror() {
   }
 }
 
-function canvasPoint(tab: MirrorTab, event: PointerEvent) {
+function canvasPointFromClient(tab: MirrorTab, clientX: number, clientY: number) {
   const canvas = tab.canvas;
   if (!canvas || !tab.session) {
     return null;
@@ -3732,64 +3765,265 @@ function canvasPoint(tab: MirrorTab, event: PointerEvent) {
   }
 
   return {
-    x: Math.round(((event.clientX - rect.left) / rect.width) * tab.session.width),
-    y: Math.round(((event.clientY - rect.top) / rect.height) * tab.session.height),
+    x: Math.round(((clientX - rect.left) / rect.width) * tab.session.width),
+    y: Math.round(((clientY - rect.top) / rect.height) * tab.session.height),
   };
 }
 
-async function sendTouch(tab: MirrorTab, action: "down" | "move" | "up", event: PointerEvent) {
+function canvasPoint(tab: MirrorTab, event: PointerEvent | WheelEvent) {
+  return canvasPointFromClient(tab, event.clientX, event.clientY);
+}
+
+function clampTouchPoint(tab: MirrorTab, point: TouchPoint): TouchPoint {
+  const width = tab.session?.width || 0;
+  const height = tab.session?.height || 0;
+  return {
+    x: Math.max(0, Math.min(width, Math.round(point.x))),
+    y: Math.max(0, Math.min(height, Math.round(point.y))),
+  };
+}
+
+async function sendTouchPoint(tab: MirrorTab, action: "down" | "move" | "up", pointerId: number, point: TouchPoint) {
   if (!tab.session || tab.state !== "running") {
     return;
   }
-  const point = canvasPoint(tab, event);
-  if (!point) {
-    return;
-  }
+  const clampedPoint = clampTouchPoint(tab, point);
 
   await invoke("scrcpy_touch", {
     request: {
       sessionId: tab.session.sessionId,
       action,
-      x: point.x,
-      y: point.y,
+      pointerId,
+      x: clampedPoint.x,
+      y: clampedPoint.y,
       videoWidth: Math.min(tab.session.width, 65535),
       videoHeight: Math.min(tab.session.height, 65535),
     },
   });
 }
 
+async function sendTouch(tab: MirrorTab, action: "down" | "move" | "up", sourcePointerId: number, event: PointerEvent) {
+  const point = canvasPoint(tab, event);
+  const pointerId = tab.activePointers.get(sourcePointerId);
+  if (!point || pointerId === undefined) {
+    return;
+  }
+  await sendTouchPoint(tab, action, pointerId, point);
+}
+
+function allocateTouchPointerId(tab: MirrorTab, sourcePointerId: number) {
+  const existing = tab.activePointers.get(sourcePointerId);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const usedPointerIds = new Set(tab.activePointers.values());
+  for (let pointerId = 0; pointerId < 32; pointerId += 1) {
+    if (!usedPointerIds.has(pointerId)) {
+      tab.activePointers.set(sourcePointerId, pointerId);
+      return pointerId;
+    }
+  }
+  const fallbackPointerId = tab.activePointers.size + 32;
+  tab.activePointers.set(sourcePointerId, fallbackPointerId);
+  return fallbackPointerId;
+}
+
+function syntheticTwoFingerPoints(tab: MirrorTab, center: TouchPoint, distance: number) {
+  const halfDistance = distance / 2;
+  return [
+    clampTouchPoint(tab, { x: center.x - halfDistance, y: center.y }),
+    clampTouchPoint(tab, { x: center.x + halfDistance, y: center.y }),
+  ] as const;
+}
+
+function syntheticPinchPoints(tab: MirrorTab) {
+  const gesture = tab.syntheticPinch;
+  return syntheticTwoFingerPoints(tab, gesture.center, gesture.distance);
+}
+
+function syntheticPanPoints(tab: MirrorTab) {
+  const gesture = tab.syntheticPan;
+  return syntheticTwoFingerPoints(tab, gesture.center, gesture.distance);
+}
+
+function clearSyntheticPinchTimer(tab: MirrorTab) {
+  if (tab.syntheticPinch.finishTimer !== null) {
+    window.clearTimeout(tab.syntheticPinch.finishTimer);
+    tab.syntheticPinch.finishTimer = null;
+  }
+}
+
+async function finishSyntheticPinch(tab: MirrorTab) {
+  if (!tab.syntheticPinch.active) {
+    return;
+  }
+  clearSyntheticPinchTimer(tab);
+  const [firstPoint, secondPoint] = syntheticPinchPoints(tab);
+  tab.syntheticPinch.active = false;
+  await sendTouchPoint(tab, "up", SYNTHETIC_PINCH_POINTER_B, secondPoint);
+  await sendTouchPoint(tab, "up", SYNTHETIC_PINCH_POINTER_A, firstPoint);
+}
+
+async function finishSyntheticPan(tab: MirrorTab) {
+  if (!tab.syntheticPan.active) {
+    return;
+  }
+  const [firstPoint, secondPoint] = syntheticPanPoints(tab);
+  tab.syntheticPan.active = false;
+  tab.syntheticPan.sourcePointerId = null;
+  await sendTouchPoint(tab, "up", SYNTHETIC_PAN_POINTER_B, secondPoint);
+  await sendTouchPoint(tab, "up", SYNTHETIC_PAN_POINTER_A, firstPoint);
+}
+
+function scheduleSyntheticPinchFinish(tab: MirrorTab) {
+  clearSyntheticPinchTimer(tab);
+  tab.syntheticPinch.finishTimer = window.setTimeout(() => {
+    void finishSyntheticPinch(tab);
+  }, SYNTHETIC_PINCH_END_DELAY_MS);
+}
+
+function clearActiveTouches(tab: MirrorTab) {
+  tab.activePointers.clear();
+  tab.lastMoveAt.clear();
+  void finishSyntheticPinch(tab);
+  void finishSyntheticPan(tab);
+}
+
+function syntheticGestureDistance(tab: MirrorTab) {
+  if (!tab.session) {
+    return 0;
+  }
+  return Math.min(tab.session.width, tab.session.height) * 0.22;
+}
+
+async function startSyntheticPan(tab: MirrorTab, event: PointerEvent) {
+  const center = canvasPoint(tab, event);
+  if (!center || !tab.session || tab.state !== "running") {
+    return;
+  }
+  if (tab.syntheticPinch.active) {
+    await finishSyntheticPinch(tab);
+  }
+  tab.syntheticPan.active = true;
+  tab.syntheticPan.sourcePointerId = event.pointerId;
+  tab.syntheticPan.center = clampTouchPoint(tab, center);
+  tab.syntheticPan.distance = syntheticGestureDistance(tab);
+  const [firstPoint, secondPoint] = syntheticPanPoints(tab);
+  await sendTouchPoint(tab, "down", SYNTHETIC_PAN_POINTER_A, firstPoint);
+  await sendTouchPoint(tab, "down", SYNTHETIC_PAN_POINTER_B, secondPoint);
+}
+
+function moveSyntheticPan(tab: MirrorTab, event: PointerEvent) {
+  if (!tab.syntheticPan.active || tab.syntheticPan.sourcePointerId !== event.pointerId) {
+    return false;
+  }
+  const center = canvasPoint(tab, event);
+  if (!center) {
+    return true;
+  }
+  const now = performance.now();
+  if (now - (tab.lastMoveAt.get(event.pointerId) || 0) < 12) {
+    return true;
+  }
+  tab.lastMoveAt.set(event.pointerId, now);
+  tab.syntheticPan.center = clampTouchPoint(tab, center);
+  const [firstPoint, secondPoint] = syntheticPanPoints(tab);
+  void sendTouchPoint(tab, "move", SYNTHETIC_PAN_POINTER_A, firstPoint);
+  void sendTouchPoint(tab, "move", SYNTHETIC_PAN_POINTER_B, secondPoint);
+  return true;
+}
+
 function onPointerDown(tab: MirrorTab, event: PointerEvent) {
-  if (event.button !== 0) {
+  if (event.pointerType === "mouse" && event.button !== 0) {
     return;
   }
   event.preventDefault();
-  tab.pointerActive = true;
   activeMirrorTabId.value = tab.id;
   tab.canvas?.setPointerCapture(event.pointerId);
-  void sendTouch(tab, "down", event);
+  if (event.pointerType === "mouse" && event.altKey) {
+    void startSyntheticPan(tab, event);
+    return;
+  }
+  if (tab.syntheticPinch.active) {
+    void finishSyntheticPinch(tab);
+  }
+  allocateTouchPointerId(tab, event.pointerId);
+  void sendTouch(tab, "down", event.pointerId, event);
 }
 
 function onPointerMove(tab: MirrorTab, event: PointerEvent) {
-  if (!tab.pointerActive) {
+  if (moveSyntheticPan(tab, event)) {
+    event.preventDefault();
+    return;
+  }
+  if (!tab.activePointers.has(event.pointerId)) {
     return;
   }
   const now = performance.now();
-  if (now - tab.lastMoveAt < 12) {
+  if (now - (tab.lastMoveAt.get(event.pointerId) || 0) < 12) {
     return;
   }
-  tab.lastMoveAt = now;
+  tab.lastMoveAt.set(event.pointerId, now);
   event.preventDefault();
-  void sendTouch(tab, "move", event);
+  void sendTouch(tab, "move", event.pointerId, event);
 }
 
 function onPointerUp(tab: MirrorTab, event: PointerEvent) {
-  if (!tab.pointerActive) {
+  if (tab.syntheticPan.active && tab.syntheticPan.sourcePointerId === event.pointerId) {
+    event.preventDefault();
+    tab.canvas?.releasePointerCapture(event.pointerId);
+    void finishSyntheticPan(tab).finally(() => {
+      tab.lastMoveAt.delete(event.pointerId);
+    });
+    return;
+  }
+  if (!tab.activePointers.has(event.pointerId)) {
     return;
   }
   event.preventDefault();
-  tab.pointerActive = false;
   tab.canvas?.releasePointerCapture(event.pointerId);
-  void sendTouch(tab, "up", event);
+  void sendTouch(tab, "up", event.pointerId, event).finally(() => {
+    tab.activePointers.delete(event.pointerId);
+    tab.lastMoveAt.delete(event.pointerId);
+  });
+}
+
+function onMirrorWheel(tab: MirrorTab, event: WheelEvent) {
+  if (!event.ctrlKey || !tab.session || tab.state !== "running" || tab.activePointers.size > 0) {
+    return;
+  }
+
+  const center = canvasPoint(tab, event);
+  if (!center) {
+    return;
+  }
+
+  event.preventDefault();
+  activeMirrorTabId.value = tab.id;
+
+  const minSize = Math.min(tab.session.width, tab.session.height);
+  const minDistance = Math.max(24, minSize * 0.05);
+  const maxDistance = Math.max(minDistance, minSize * 0.85);
+  const wasActive = tab.syntheticPinch.active;
+  tab.syntheticPinch.center = clampTouchPoint(tab, center);
+  tab.syntheticPinch.distance = wasActive ? tab.syntheticPinch.distance : minSize * 0.22;
+  tab.syntheticPinch.distance = Math.max(
+    minDistance,
+    Math.min(maxDistance, tab.syntheticPinch.distance - event.deltaY * 0.45),
+  );
+  tab.syntheticPinch.active = true;
+
+  const [firstPoint, secondPoint] = syntheticPinchPoints(tab);
+  const sendGesture = async () => {
+    if (!wasActive) {
+      await sendTouchPoint(tab, "down", SYNTHETIC_PINCH_POINTER_A, firstPoint);
+      await sendTouchPoint(tab, "down", SYNTHETIC_PINCH_POINTER_B, secondPoint);
+    }
+    await sendTouchPoint(tab, "move", SYNTHETIC_PINCH_POINTER_A, firstPoint);
+    await sendTouchPoint(tab, "move", SYNTHETIC_PINCH_POINTER_B, secondPoint);
+    scheduleSyntheticPinchFinish(tab);
+  };
+  void sendGesture();
 }
 
 async function sendKey(keycode: number) {
@@ -5426,6 +5660,7 @@ onBeforeUnmount(() => {
             @pointermove="onPointerMove(tab, $event)"
             @pointerup="onPointerUp(tab, $event)"
             @pointercancel="onPointerUp(tab, $event)"
+            @wheel="onMirrorWheel(tab, $event)"
           ></canvas>
           <div v-if="shouldShowScreenPlaceholder(tab)" class="screen-placeholder">
             <strong>{{ screenPlaceholderFor(tab).title }}</strong>

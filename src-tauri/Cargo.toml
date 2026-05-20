@@ -1,6 +1,6 @@
 [package]
 name = "droidpilot"
-version = "1.0.3"
+version = "1.0.4"
 description = "Desktop Android device control assistant"
 authors = ["you"]
 edition = "2021"

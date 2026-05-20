@@ -61,6 +61,7 @@ pub struct ScrcpyStartResult {
 pub struct ScrcpyTouchRequest {
     session_id: u64,
     action: String,
+    pointer_id: Option<u64>,
     x: i32,
     y: i32,
     video_width: u16,
@@ -618,7 +619,10 @@ fn serialize_touch(request: ScrcpyTouchRequest) -> Result<Vec<u8>, String> {
     let mut buf = Vec::with_capacity(32);
     buf.push(2);
     buf.push(action);
-    write_u64be(&mut buf, POINTER_ID_GENERIC_FINGER);
+    write_u64be(
+        &mut buf,
+        request.pointer_id.unwrap_or(POINTER_ID_GENERIC_FINGER),
+    );
     write_u32be(&mut buf, x as u32);
     write_u32be(&mut buf, y as u32);
     write_u16be(&mut buf, request.video_width);
