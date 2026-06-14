@@ -4,6 +4,7 @@ import { storeToRefs } from "pinia";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { downloadDir, homeDir } from "@tauri-apps/api/path";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -55,12 +56,44 @@ interface RemoteEntry {
   name: string;
   path: string;
   isDir: boolean;
+  sizeBytes?: number | null;
+  createdAtMs?: number | null;
 }
 
 interface LocalEntry {
   name: string;
   path: string;
   isDir: boolean;
+  sizeBytes?: number | null;
+  createdAtMs?: number | null;
+}
+
+type TransferEntryScope = "local" | "remote";
+type TransferEntry = LocalEntry | RemoteEntry;
+type FileEntryIconName = "folder" | "apk" | "image" | "video" | "pdf" | "code" | "text" | "archive" | "audio" | "file";
+type FileEntrySortKey = "name" | "size" | "date";
+type FileEntrySortDirection = "asc" | "desc";
+type TransferToolIconName = "chooseFolder" | "copyToDevice" | "copyToComputer" | "apk" | "preview" | "refresh" | "delete";
+type TransferMenuAction = "copyToDevice" | "copyToComputer" | "install" | "preview" | "refresh" | "delete";
+
+interface FileEntrySortState {
+  key: FileEntrySortKey;
+  direction: FileEntrySortDirection;
+}
+
+interface TransferContextMenuState {
+  scope: TransferEntryScope;
+  entry: TransferEntry;
+  x: number;
+  y: number;
+}
+
+interface TransferContextMenuItem {
+  action: TransferMenuAction;
+  label: string;
+  icon: TransferToolIconName;
+  disabled: boolean;
+  danger?: boolean;
 }
 
 interface TransferProgressPayload {
@@ -116,7 +149,7 @@ interface TerminalSpawnResult {
 
 interface TerminalOutputPayload {
   sessionId: number;
-  data: string;
+  dataBase64: string;
 }
 
 interface TerminalExitPayload {
@@ -280,6 +313,7 @@ const recordingMirrorTabId = ref<number | null>(null);
 const savingLocalRecording = ref(false);
 const recordingElapsedSeconds = ref(0);
 const defaultDeviceRoot = "/storage/emulated/0/";
+const localDrivesRoot = "__DROIDPILOT_WINDOWS_DRIVES__";
 const remoteBrowserPath = ref(defaultDeviceRoot);
 const remoteEntries = ref<RemoteEntry[]>([]);
 const browsingRemote = ref(false);
@@ -290,6 +324,12 @@ const browsingLocal = ref(false);
 const localBrowseError = ref("");
 const selectedLocalPath = ref("");
 const selectedRemotePath = ref("");
+const localEntrySort = ref<FileEntrySortState>({ key: "name", direction: "asc" });
+const remoteEntrySort = ref<FileEntrySortState>({ key: "name", direction: "asc" });
+const transferContextMenu = ref<TransferContextMenuState | null>(null);
+const fileDropActive = ref(false);
+const fileDropBusy = ref(false);
+const fileDropMessage = ref("");
 const copyDirection = ref<"push" | "pull" | "install" | null>(null);
 const copyProgressPercent = ref<number | null>(null);
 const copyProgressMessage = ref("");
@@ -345,6 +385,7 @@ let unlistenStatus: UnlistenFn | null = null;
 let unlistenTransferProgress: UnlistenFn | null = null;
 let unlistenTerminalOutput: UnlistenFn | null = null;
 let unlistenTerminalExit: UnlistenFn | null = null;
+let unlistenFileDrop: UnlistenFn | null = null;
 let resolveMirrorEventListenersReady: (() => void) | null = null;
 let mirrorEventListenersReady = new Promise<void>((resolve) => {
   resolveMirrorEventListenersReady = resolve;
@@ -358,6 +399,10 @@ let terminalFitAddon: FitAddon | null = null;
 let terminalDataDisposable: { dispose: () => void } | null = null;
 let terminalResizeObserver: ResizeObserver | null = null;
 let terminalResizeTimer: number | null = null;
+let terminalOutputQueue: Uint8Array[] = [];
+let terminalOutputQueuedBytes = 0;
+let terminalOutputWriteActive = false;
+let transferContextMenuOpenedAt = 0;
 let recordingTimer: number | null = null;
 let recordingStartedAt = 0;
 let terminalLastRows = 0;
@@ -375,6 +420,8 @@ const MIRROR_START_TIMEOUT_MS = 32_000;
 const MIRROR_AUTO_RESTART_DELAY_MS = 5_000;
 const MAX_PENDING_SCRCPY_FRAMES = 360;
 const MAX_INITIAL_SCRCPY_FLUSH_TAIL_FRAMES = 2;
+const TERMINAL_OUTPUT_MAX_QUEUE_BYTES = 4 * 1024 * 1024;
+const TERMINAL_OUTPUT_CHUNK_BYTES = 128 * 1024;
 
 function mirrorDebug(_event: string, _details?: unknown) {
 }
@@ -499,21 +546,50 @@ const workspaceTabs = computed<WorkspaceTab[]>(() => {
 });
 const state = computed(() => activeMirrorTab.value?.state || "idle");
 const atSdcardRoot = computed(() => remoteBrowserPath.value === defaultDeviceRoot);
+const atLocalDrivesRoot = computed(() => localBrowserPath.value === localDrivesRoot);
+const localBrowserPathLabel = computed(() => atLocalDrivesRoot.value ? "此电脑" : (localBrowserPath.value || "系统目录"));
 const canGoLocalParent = computed(() => {
   return Boolean(parentLocalPath(localBrowserPath.value));
 });
+const sortedLocalEntries = computed(() => sortTransferEntries(localEntries.value, localEntrySort.value));
+const sortedRemoteEntries = computed(() => sortTransferEntries(remoteEntries.value, remoteEntrySort.value));
 const selectedLocalEntry = computed(() => localEntries.value.find((entry) => entry.path === selectedLocalPath.value) || null);
-const canCopyLocalToRemote = computed(() => Boolean(selectedLocalPath.value && selectedSerial.value && !quickBusy.value));
-const canCopyRemoteToLocal = computed(() => Boolean(selectedRemotePath.value && localBrowserPath.value && !quickBusy.value));
+const canCopyLocalToRemote = computed(() => Boolean(selectedLocalPath.value && selectedSerial.value && !isWindowsDrivePath(selectedLocalPath.value) && !quickBusy.value));
+const canCopyRemoteToLocal = computed(() => Boolean(selectedRemotePath.value && localBrowserPath.value && !atLocalDrivesRoot.value && !quickBusy.value));
 const canInstallSelectedApk = computed(() => {
   return Boolean(selectedSerial.value && selectedLocalPath.value && !selectedLocalEntry.value?.isDir && isApkPath(selectedLocalPath.value) && !quickBusy.value);
 });
-const canDeleteLocal = computed(() => Boolean(selectedLocalPath.value && !quickBusy.value && !browsingLocal.value));
+const canDeleteLocal = computed(() => Boolean(selectedLocalPath.value && !isWindowsDrivePath(selectedLocalPath.value) && !quickBusy.value && !browsingLocal.value));
 const canDeleteRemote = computed(() => Boolean(selectedRemotePath.value && selectedSerial.value && !quickBusy.value && !browsingRemote.value));
 const deleteConfirmTitle = computed(() => (deleteConfirmTarget.value?.scope === "local" ? "删除本地项目" : "删除设备项目"));
 const canPreviewSelectedLocalText = computed(() => Boolean(selectedLocalPath.value && !selectedLocalEntry.value?.isDir && isPreviewablePath(selectedLocalPath.value)));
 const selectedRemoteEntry = computed(() => remoteEntries.value.find((entry) => entry.path === selectedRemotePath.value) || null);
 const canPreviewSelectedRemoteText = computed(() => Boolean(selectedRemotePath.value && selectedSerial.value && !selectedRemoteEntry.value?.isDir && isPreviewablePath(selectedRemotePath.value)));
+const transferContextMenuItems = computed<TransferContextMenuItem[]>(() => {
+  const menu = transferContextMenu.value;
+  if (!menu) {
+    return [];
+  }
+
+  const common = [
+    { action: "preview" as const, label: "预览", icon: "preview" as const, disabled: menu.entry.isDir || !isPreviewablePath(menu.entry.path) },
+    { action: "refresh" as const, label: "刷新", icon: "refresh" as const, disabled: menu.scope === "local" ? browsingLocal.value : browsingRemote.value },
+    { action: "delete" as const, label: "删除", icon: "delete" as const, danger: true, disabled: menu.scope === "local" ? !canDeleteLocal.value : !canDeleteRemote.value },
+  ];
+
+  if (menu.scope === "local") {
+    return [
+      { action: "copyToDevice" as const, label: "传到设备", icon: "copyToDevice" as const, disabled: !canCopyLocalToRemote.value },
+      { action: "install" as const, label: "安装 APK", icon: "apk" as const, disabled: !canInstallSelectedApk.value },
+      ...common,
+    ];
+  }
+
+  return [
+    { action: "copyToComputer" as const, label: "传到电脑", icon: "copyToComputer" as const, disabled: !canCopyRemoteToLocal.value },
+    ...common,
+  ];
+});
 const recordingElapsedLabel = computed(() => formatDuration(recordingElapsedSeconds.value));
 const textPreviewLineHeight = 20;
 const textPreviewChunkSize = 256 * 1024;
@@ -631,6 +707,22 @@ const transferToolIconPaths = {
   preview: ["M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z", "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"],
   refresh: ["M20 12a8 8 0 1 1-2.3-5.7", "M20 4v6h-6"],
   delete: ["M4 7h16", "M10 11v6", "M14 11v6", "M6 7l1 13h10l1-13", "M9 7V4h6v3"],
+};
+const fileEntryIconPaths: Record<FileEntryIconName, string[]> = {
+  folder: ["M3 7h6l2 2h10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z", "M3 7V5a2 2 0 0 1 2-2h4l2 2h5"],
+  apk: ["M7 4h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M9 9h6", "M9 13h6", "M10 4V2", "M14 4V2"],
+  image: ["M4 5h16v14H4z", "M8 13l2.5-3 3.5 4 2-2.5 4 5.5", "M8.5 8.5h.01"],
+  video: ["M4 6h12v12H4z", "M16 10l5-3v10l-5-3z", "M8 6v12"],
+  pdf: ["M6 3h9l4 4v14H6z", "M15 3v5h5", "M8 16h8", "M8 12h6"],
+  code: ["M9 8l-4 4 4 4", "M15 8l4 4-4 4", "M13 5l-2 14"],
+  text: ["M6 3h9l4 4v14H6z", "M15 3v5h5", "M8 12h8", "M8 16h6"],
+  archive: ["M6 3h12v18H6z", "M10 3v18", "M10 7h4", "M10 11h4", "M10 15h4"],
+  audio: ["M9 18V6l8-2v12", "M9 18a3 3 0 1 1-2-2.83", "M17 16a3 3 0 1 1-2-2.83"],
+  file: ["M6 3h9l4 4v14H6z", "M15 3v5h5"],
+};
+const fileEntrySortIconPaths: Record<FileEntrySortDirection, string[]> = {
+  asc: ["M12 19V5", "M6 11l6-6 6 6"],
+  desc: ["M12 5v14", "M6 13l6 6 6-6"],
 };
 const quickCommands = computed<QuickCommandItem[]>(() => {
   const localDir = defaultLocalDir.value.trim();
@@ -855,6 +947,19 @@ function adbTerminalCommand(args: string) {
   return serial ? `adb -s ${serial} ${args}` : `adb ${args}`;
 }
 
+const fileEntryDateFormatter = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+const fileEntryNameCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+
 function formatBytes(value: number) {
   if (!Number.isFinite(value) || value <= 0) {
     return "0 B";
@@ -869,6 +974,80 @@ function formatBytes(value: number) {
   return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
 }
 
+function formatEntrySize(entry: TransferEntry) {
+  if (entry.isDir || typeof entry.sizeBytes !== "number") {
+    return "--";
+  }
+  return formatBytes(entry.sizeBytes);
+}
+
+function formatEntryCreatedAt(entry: TransferEntry) {
+  const value = typeof entry.createdAtMs === "number" ? entry.createdAtMs : 0;
+  if (!Number.isFinite(value) || value <= 0) {
+    return "--";
+  }
+  return fileEntryDateFormatter.format(new Date(value));
+}
+
+function compareEntryName(a: TransferEntry, b: TransferEntry, direction: FileEntrySortDirection) {
+  const result = fileEntryNameCollator.compare(a.name, b.name);
+  return direction === "asc" ? result : -result;
+}
+
+function compareOptionalNumber(a: number | null | undefined, b: number | null | undefined, direction: FileEntrySortDirection) {
+  const aValid = typeof a === "number" && Number.isFinite(a);
+  const bValid = typeof b === "number" && Number.isFinite(b);
+  if (!aValid && !bValid) {
+    return 0;
+  }
+  if (!aValid) {
+    return 1;
+  }
+  if (!bValid) {
+    return -1;
+  }
+  return direction === "asc" ? a - b : b - a;
+}
+
+function compareTransferEntry(a: TransferEntry, b: TransferEntry, sort: FileEntrySortState) {
+  if (a.isDir !== b.isDir) {
+    return a.isDir ? -1 : 1;
+  }
+
+  let result = 0;
+  if (sort.key === "name") {
+    result = compareEntryName(a, b, sort.direction);
+  } else if (sort.key === "size") {
+    result = compareOptionalNumber(a.sizeBytes, b.sizeBytes, sort.direction);
+  } else {
+    result = compareOptionalNumber(a.createdAtMs, b.createdAtMs, sort.direction);
+  }
+
+  return result || compareEntryName(a, b, "asc") || fileEntryNameCollator.compare(a.path, b.path);
+}
+
+function sortTransferEntries<T extends TransferEntry>(entries: T[], sort: FileEntrySortState) {
+  return [...entries].sort((a, b) => compareTransferEntry(a, b, sort));
+}
+
+function toggleFileEntrySort(scope: TransferEntryScope, key: FileEntrySortKey) {
+  const target = scope === "local" ? localEntrySort : remoteEntrySort;
+  target.value = target.value.key === key
+    ? { key, direction: target.value.direction === "asc" ? "desc" : "asc" }
+    : { key, direction: "asc" };
+}
+
+function fileEntrySortIconDirection(sort: FileEntrySortState, key: FileEntrySortKey): FileEntrySortDirection {
+  return sort.key === key ? sort.direction : "asc";
+}
+
+function fileEntrySortButtonLabel(sort: FileEntrySortState, key: FileEntrySortKey, label: string) {
+  if (sort.key !== key) {
+    return `按${label}排序`;
+  }
+  return `${label}${sort.direction === "asc" ? "升序" : "降序"}`;
+}
+
 function requireSelectedDevice() {
   if (selectedSerial.value) {
     return true;
@@ -879,6 +1058,28 @@ function requireSelectedDevice() {
 
 function isApkPath(path: string) {
   return path.trim().toLowerCase().endsWith(".apk");
+}
+
+function localPathDisplayName(path: string) {
+  const normalized = path.trim().replace(/[\\/]+$/, "");
+  return normalized.split(/[\\/]/).pop() || normalized || "拖入项目";
+}
+
+function normalizeRemoteDropTargetPath() {
+  const configured = adbStore.defaultDevicePath.trim() || defaultDeviceRoot;
+  return configured.endsWith("/") ? configured : `${configured}/`;
+}
+
+function fileDropSummaryMessage(paths: string[]) {
+  const apkCount = paths.filter(isApkPath).length;
+  const copyCount = paths.length - apkCount;
+  if (apkCount > 0 && copyCount > 0) {
+    return `释放后安装 ${apkCount} 个 APK，复制 ${copyCount} 个文件/目录`;
+  }
+  if (apkCount > 0) {
+    return `释放后安装 ${apkCount} 个 APK`;
+  }
+  return `释放后复制 ${copyCount || paths.length} 个文件/目录到默认设备目录`;
 }
 
 function isTextPreviewPath(path: string) {
@@ -903,6 +1104,45 @@ function isVideoPreviewPath(path: string) {
 
 function isPreviewablePath(path: string) {
   return isTextPreviewPath(path) || isHtmlPreviewPath(path) || isPdfPreviewPath(path) || isImagePreviewPath(path) || isVideoPreviewPath(path);
+}
+
+function fileExtension(path: string) {
+  const name = path.trim().split(/[\\/]/).pop() || "";
+  const dotIndex = name.lastIndexOf(".");
+  return dotIndex > 0 ? name.slice(dotIndex + 1).toLowerCase() : "";
+}
+
+function fileEntryIconName(entry: TransferEntry): FileEntryIconName {
+  if (entry.isDir) {
+    return "folder";
+  }
+  if (isApkPath(entry.path)) {
+    return "apk";
+  }
+  if (isImagePreviewPath(entry.path)) {
+    return "image";
+  }
+  if (isVideoPreviewPath(entry.path)) {
+    return "video";
+  }
+  if (isPdfPreviewPath(entry.path)) {
+    return "pdf";
+  }
+
+  const extension = fileExtension(entry.path);
+  if (["mp3", "wav", "flac", "aac", "m4a", "opus"].includes(extension)) {
+    return "audio";
+  }
+  if (["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz"].includes(extension)) {
+    return "archive";
+  }
+  if (["js", "ts", "vue", "rs", "kt", "java", "gradle", "sh", "bat", "ps1", "css", "html", "htm", "xml", "json", "yaml", "yml"].includes(extension)) {
+    return "code";
+  }
+  if (isTextPreviewPath(entry.path)) {
+    return "text";
+  }
+  return "file";
 }
 
 function previewModeForPath(path: string): TextPreviewMode {
@@ -4228,6 +4468,7 @@ async function ensureLocalBrowserPath() {
 }
 
 async function loadLocalEntries(path?: string) {
+  closeTransferContextMenu();
   browsingLocal.value = true;
   localBrowseError.value = "";
 
@@ -4260,10 +4501,20 @@ function goLocalParentDirectory() {
   void loadLocalEntries(parent);
 }
 
+function isWindowsDrivePath(path: string) {
+  return /^[A-Za-z]:[\\/]?$/.test(path.trim());
+}
+
 function parentLocalPath(path: string) {
   const current = path.trim().replace(/[\\/]+$/, "");
   if (!current) {
     return "";
+  }
+  if (current === localDrivesRoot) {
+    return "";
+  }
+  if (/^[A-Za-z]:$/.test(current)) {
+    return localDrivesRoot;
   }
 
   const idx = Math.max(current.lastIndexOf("/"), current.lastIndexOf("\\"));
@@ -4280,7 +4531,142 @@ function parentLocalPath(path: string) {
 
 function selectLocalEntry(entry: LocalEntry) {
   selectedLocalPath.value = entry.path;
-  adbStore.setUploadLocalPath(entry.path);
+  if (!isWindowsDrivePath(entry.path)) {
+    adbStore.setUploadLocalPath(entry.path);
+  }
+}
+
+function closeTransferContextMenu(event?: Event) {
+  if (transferContextMenuOpenedAt && Date.now() - transferContextMenuOpenedAt < 180) {
+    return;
+  }
+  if (event instanceof MouseEvent && event.button !== 0) {
+    return;
+  }
+  transferContextMenu.value = null;
+}
+
+function transferContextMenuPosition(x: number, y: number, itemCount: number) {
+  const menuWidth = 188;
+  const menuHeight = 14 + itemCount * 34;
+  return {
+    x: Math.min(x, Math.max(8, window.innerWidth - menuWidth - 8)),
+    y: Math.min(y, Math.max(8, window.innerHeight - menuHeight - 8)),
+  };
+}
+
+function transferContextMenuAnchor(event: MouseEvent | KeyboardEvent) {
+  if (event instanceof MouseEvent) {
+    return { x: event.clientX, y: event.clientY };
+  }
+
+  const target = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  const rect = target?.getBoundingClientRect();
+  return {
+    x: rect ? rect.right : Math.floor(window.innerWidth / 2),
+    y: rect ? rect.top : Math.floor(window.innerHeight / 2),
+  };
+}
+
+function openTransferContextMenu(event: MouseEvent | KeyboardEvent, scope: TransferEntryScope, entry: TransferEntry) {
+  event.preventDefault();
+  event.stopPropagation();
+
+  if (scope === "local") {
+    selectLocalEntry(entry as LocalEntry);
+  } else {
+    selectRemoteEntry(entry as RemoteEntry);
+  }
+
+  const itemCount = scope === "local" ? 5 : 4;
+  const anchor = transferContextMenuAnchor(event);
+  const position = transferContextMenuPosition(anchor.x, anchor.y, itemCount);
+  transferContextMenuOpenedAt = Date.now();
+  transferContextMenu.value = {
+    scope,
+    entry,
+    ...position,
+  };
+}
+
+function transferEntryFromEvent(event: Event, scope: TransferEntryScope) {
+  const target = event.target instanceof HTMLElement ? event.target : null;
+  const row = target?.closest<HTMLElement>(".file-tree-item[data-entry-path]");
+  const path = row?.dataset.entryPath;
+  if (!path) {
+    return null;
+  }
+
+  return scope === "local"
+    ? localEntries.value.find((entry) => entry.path === path) || null
+    : remoteEntries.value.find((entry) => entry.path === path) || null;
+}
+
+function openTransferListContextMenu(event: MouseEvent, scope: TransferEntryScope) {
+  const entry = transferEntryFromEvent(event, scope);
+  if (!entry) {
+    closeTransferContextMenu();
+    return;
+  }
+
+  openTransferContextMenu(event, scope, entry);
+}
+
+function onTransferListPointerDown(event: PointerEvent, scope: TransferEntryScope) {
+  if (event.button !== 2) {
+    return;
+  }
+
+  const entry = transferEntryFromEvent(event, scope);
+  if (!entry) {
+    return;
+  }
+
+  openTransferContextMenu(event, scope, entry);
+}
+
+async function runTransferContextMenuAction(action: TransferMenuAction) {
+  const menu = transferContextMenu.value;
+  const item = transferContextMenuItems.value.find((current) => current.action === action);
+  if (!menu || item?.disabled) {
+    return;
+  }
+
+  closeTransferContextMenu();
+  switch (action) {
+    case "copyToDevice":
+      await copyLocalToRemote();
+      break;
+    case "copyToComputer":
+      await copyRemoteToLocal();
+      break;
+    case "install":
+      await installSelectedApk();
+      break;
+    case "preview":
+      await openTextPreview(menu.scope, menu.entry.path);
+      break;
+    case "refresh":
+      if (menu.scope === "local") {
+        await loadLocalEntries();
+      } else {
+        await loadRemoteEntries();
+      }
+      break;
+    case "delete":
+      if (menu.scope === "local") {
+        requestDeleteSelectedLocalEntry();
+      } else {
+        requestDeleteSelectedRemoteEntry();
+      }
+      break;
+  }
+}
+
+function handleTransferContextMenuKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape" && transferContextMenu.value) {
+    closeTransferContextMenu();
+  }
 }
 
 function enterLocalDirectory(entry: LocalEntry) {
@@ -4294,6 +4680,7 @@ function enterLocalDirectory(entry: LocalEntry) {
 }
 
 async function loadRemoteEntries(path = remoteBrowserPath.value) {
+  closeTransferContextMenu();
   if (!selectedSerial.value) {
     remoteEntries.value = [];
     remoteBrowseError.value = "请先选择设备";
@@ -5053,23 +5440,32 @@ async function installSelectedApk() {
   await installApkPath(selectedLocalPath.value);
 }
 
-async function copyLocalToRemote() {
+async function copyLocalPathToRemote(localPath: string, targetRemotePath: string, reloadTarget = true) {
   if (!requireSelectedDevice() || quickBusy.value) {
     return;
   }
+  if (!localPath.trim()) {
+    adbStore.setNotice("error", "请先在系统目录中选择文件或目录");
+    return;
+  }
+
+  resetCopyProgress("push");
+  adbStore.setUploadLocalPath(localPath);
+  adbStore.setDefaultDevicePath(targetRemotePath);
+  await adbStore.runTransfer("push", localPath, targetRemotePath);
+  if (!transferRunning.value && reloadTarget) {
+    await loadRemoteEntries(targetRemotePath);
+  }
+}
+
+async function copyLocalToRemote() {
   if (!selectedLocalPath.value) {
     adbStore.setNotice("error", "请先在系统目录中选择文件或目录");
     return;
   }
 
   const targetRemotePath = remoteBrowserPath.value.trim() || defaultDeviceRoot;
-  resetCopyProgress("push");
-  adbStore.setUploadLocalPath(selectedLocalPath.value);
-  adbStore.setDefaultDevicePath(targetRemotePath);
-  await adbStore.runTransfer("push", selectedLocalPath.value, targetRemotePath);
-  if (!transferRunning.value) {
-    await loadRemoteEntries(targetRemotePath);
-  }
+  await copyLocalPathToRemote(selectedLocalPath.value, targetRemotePath);
 }
 
 async function copyRemoteToLocal() {
@@ -5084,6 +5480,10 @@ async function copyRemoteToLocal() {
     adbStore.setNotice("error", "请先选择系统目录");
     return;
   }
+  if (atLocalDrivesRoot.value) {
+    adbStore.setNotice("error", "请先进入某个磁盘目录");
+    return;
+  }
 
   adbStore.setDefaultDevicePath(selectedRemotePath.value);
   adbStore.setDefaultLocalDir(localBrowserPath.value);
@@ -5091,6 +5491,76 @@ async function copyRemoteToLocal() {
   await adbStore.runTransfer("pull", localBrowserPath.value, selectedRemotePath.value);
   if (!transferRunning.value) {
     await loadLocalEntries(localBrowserPath.value);
+  }
+}
+
+function updateFileDropHover(paths: string[] = []) {
+  if (fileDropBusy.value) {
+    return;
+  }
+  fileDropActive.value = true;
+  fileDropMessage.value = paths.length
+    ? fileDropSummaryMessage(paths)
+    : fileDropMessage.value || "释放后复制到默认设备目录，APK 将安装";
+}
+
+function clearFileDropHover() {
+  fileDropActive.value = false;
+  if (!fileDropBusy.value) {
+    fileDropMessage.value = "";
+  }
+}
+
+async function handleDroppedLocalPaths(paths: string[]) {
+  const localPaths = paths.map((path) => path.trim()).filter(Boolean);
+  fileDropActive.value = false;
+
+  if (fileDropBusy.value) {
+    adbStore.setNotice("info", "拖拽任务正在处理，请稍后再试");
+    return;
+  }
+  if (localPaths.length === 0) {
+    fileDropMessage.value = "";
+    return;
+  }
+  if (!requireSelectedDevice()) {
+    fileDropMessage.value = "";
+    return;
+  }
+  if (quickBusy.value) {
+    adbStore.setNotice("info", "当前有传输任务正在运行，请稍后再拖入");
+    fileDropMessage.value = "";
+    return;
+  }
+
+  const apkPaths = localPaths.filter(isApkPath);
+  const copyPaths = localPaths.filter((path) => !isApkPath(path));
+  const targetRemotePath = normalizeRemoteDropTargetPath();
+
+  fileDropBusy.value = true;
+  try {
+    for (const apkPath of apkPaths) {
+      fileDropMessage.value = `正在安装 ${localPathDisplayName(apkPath)}`;
+      await installApkPath(apkPath);
+    }
+
+    for (const localPath of copyPaths) {
+      fileDropMessage.value = `正在复制 ${localPathDisplayName(localPath)}`;
+      await copyLocalPathToRemote(localPath, targetRemotePath, false);
+    }
+
+    if (copyPaths.length > 0) {
+      fileDropMessage.value = "正在刷新设备目录";
+      await loadRemoteEntries(targetRemotePath);
+    }
+
+    if (adbStore.notice?.type !== "error") {
+      adbStore.setNotice("success", "拖拽文件处理完成");
+    }
+  } finally {
+    fileDropBusy.value = false;
+    fileDropActive.value = false;
+    fileDropMessage.value = "";
   }
 }
 
@@ -5153,6 +5623,7 @@ function disposeTerminalView() {
     window.clearTimeout(terminalResizeTimer);
     terminalResizeTimer = null;
   }
+  resetTerminalOutputQueue();
   terminalResizeObserver?.disconnect();
   terminalResizeObserver = null;
   terminalDataDisposable?.dispose();
@@ -5164,6 +5635,95 @@ function disposeTerminalView() {
   terminalLastCols = 0;
   terminalLastHostWidth = 0;
   terminalLastHostHeight = 0;
+}
+
+function resetTerminalOutputQueue(preserveWriteActive = false) {
+  terminalOutputQueue = [];
+  terminalOutputQueuedBytes = 0;
+  if (!preserveWriteActive) {
+    terminalOutputWriteActive = false;
+  }
+}
+
+function decodeTerminalOutput(dataBase64: string) {
+  if (!dataBase64) {
+    return new Uint8Array();
+  }
+
+  const binary = window.atob(dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function takeTerminalOutputChunk() {
+  const chunkSize = Math.min(TERMINAL_OUTPUT_CHUNK_BYTES, terminalOutputQueuedBytes);
+  if (chunkSize <= 0) {
+    return new Uint8Array();
+  }
+
+  const chunk = new Uint8Array(chunkSize);
+  let offset = 0;
+  while (offset < chunkSize && terminalOutputQueue.length > 0) {
+    const head = terminalOutputQueue[0];
+    const remaining = chunkSize - offset;
+    if (head.length <= remaining) {
+      chunk.set(head, offset);
+      offset += head.length;
+      terminalOutputQueue.shift();
+    } else {
+      chunk.set(head.subarray(0, remaining), offset);
+      terminalOutputQueue[0] = head.subarray(remaining);
+      offset += remaining;
+    }
+  }
+
+  terminalOutputQueuedBytes -= chunkSize;
+  return chunk;
+}
+
+function scheduleTerminalOutputFlush() {
+  if (terminalOutputWriteActive || terminalOutputQueue.length === 0) {
+    return;
+  }
+
+  terminalOutputWriteActive = true;
+  window.requestAnimationFrame(flushTerminalOutputQueue);
+}
+
+function flushTerminalOutputQueue() {
+  if (!terminal || !terminalSessionId.value) {
+    resetTerminalOutputQueue();
+    return;
+  }
+
+  const chunk = takeTerminalOutputChunk();
+  if (chunk.length === 0) {
+    terminalOutputWriteActive = false;
+    return;
+  }
+
+  terminal.write(chunk, () => {
+    terminalOutputWriteActive = false;
+    scheduleTerminalOutputFlush();
+  });
+}
+
+function enqueueTerminalOutput(bytes: Uint8Array) {
+  if (bytes.length === 0) {
+    return;
+  }
+
+  if (terminalOutputQueuedBytes + bytes.length > TERMINAL_OUTPUT_MAX_QUEUE_BYTES) {
+    resetTerminalOutputQueue(true);
+    terminal?.writeln("\r\n[terminal output skipped: buffer limit exceeded]\r\n");
+  }
+
+  terminalOutputQueue.push(bytes);
+  terminalOutputQueuedBytes += bytes.length;
+  scheduleTerminalOutputFlush();
 }
 
 function focusTerminalView() {
@@ -5267,6 +5827,7 @@ async function closeTerminalSession() {
   const sessionId = terminalSessionId.value;
   terminalSessionId.value = null;
   terminalShell.value = "";
+  resetTerminalOutputQueue();
   if (!sessionId) {
     return;
   }
@@ -5281,7 +5842,11 @@ function handleTerminalOutput(payload: TerminalOutputPayload) {
   if (payload.sessionId !== terminalSessionId.value) {
     return;
   }
-  terminal?.write(payload.data);
+  try {
+    enqueueTerminalOutput(decodeTerminalOutput(payload.dataBase64));
+  } catch {
+    adbStore.setNotice("error", "终端输出解码失败");
+  }
 }
 
 function handleTerminalExit(payload: TerminalExitPayload) {
@@ -5289,6 +5854,7 @@ function handleTerminalExit(payload: TerminalExitPayload) {
     return;
   }
   terminalSessionId.value = null;
+  resetTerminalOutputQueue();
   terminal?.writeln(`\r\n[${payload.message}]`);
 }
 
@@ -5552,6 +6118,8 @@ function handleMirrorKeydown(event: KeyboardEvent) {
 onMounted(async () => {
   window.addEventListener("droidpilot:mirror-toolbar-action", handleMirrorToolbarAction);
   window.addEventListener("keydown", handleMirrorKeydown);
+  window.addEventListener("click", closeTransferContextMenu);
+  window.addEventListener("keydown", handleTransferContextMenuKeydown);
   window.setTimeout(emitMirrorToolbarState, 0);
   unlistenFrame = await listen<ScrcpyFramePayload>("scrcpy://frame", (event) => handleFrame(event.payload));
   unlistenStatus = await listen<ScrcpyStatusPayload>("scrcpy://status", (event) => handleStatus(event.payload));
@@ -5563,6 +6131,22 @@ onMounted(async () => {
   );
   unlistenTerminalOutput = await listen<TerminalOutputPayload>("terminal-output", (event) => handleTerminalOutput(event.payload));
   unlistenTerminalExit = await listen<TerminalExitPayload>("terminal-exit", (event) => handleTerminalExit(event.payload));
+  unlistenFileDrop = await getCurrentWebview().onDragDropEvent((event) => {
+    const payload = event.payload;
+    if (payload.type === "enter") {
+      updateFileDropHover(payload.paths);
+      return;
+    }
+    if (payload.type === "over") {
+      updateFileDropHover();
+      return;
+    }
+    if (payload.type === "drop") {
+      void handleDroppedLocalPaths(payload.paths);
+      return;
+    }
+    clearFileDropHover();
+  });
   if (!defaultLocalDir.value.trim()) {
     try {
       const dir = await downloadDir();
@@ -5578,11 +6162,14 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener("droidpilot:mirror-toolbar-action", handleMirrorToolbarAction);
   window.removeEventListener("keydown", handleMirrorKeydown);
+  window.removeEventListener("click", closeTransferContextMenu);
+  window.removeEventListener("keydown", handleTransferContextMenuKeydown);
   unlistenFrame?.();
   unlistenStatus?.();
   unlistenTransferProgress?.();
   unlistenTerminalOutput?.();
   unlistenTerminalExit?.();
+  unlistenFileDrop?.();
   if (localMediaRecorder && localMediaRecorder.state !== "inactive") {
     stopRecordingTimer();
     localMediaRecorder.stop();
@@ -5603,6 +6190,12 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="mirror-layout">
+    <div v-if="fileDropActive || fileDropBusy" class="mirror-file-drop-overlay" :class="{ busy: fileDropBusy }">
+      <div class="mirror-file-drop-panel">
+        <strong>{{ fileDropBusy ? "正在处理拖入文件" : "释放文件" }}</strong>
+        <span>{{ fileDropMessage }}</span>
+      </div>
+    </div>
     <section class="mirror-stage">
       <div v-if="workspaceTabs.length > 0" class="mirror-tabbar">
         <div ref="mirrorTabListRef" class="mirror-tab-list" @wheel="onMirrorTabListWheel">
@@ -5915,7 +6508,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
             </div>
-            <div class="file-path-bar mono">{{ localBrowserPath || "系统目录" }}</div>
+            <div class="file-path-bar mono">{{ localBrowserPathLabel }}</div>
 
             <button type="button" class="file-parent-row mono" :disabled="!canGoLocalParent || browsingLocal" @dblclick="goLocalParentDirectory">
               ...
@@ -5924,21 +6517,83 @@ onBeforeUnmount(() => {
             <p class="helper" v-if="browsingLocal">目录读取中...</p>
             <p class="helper" v-else-if="localBrowseError">{{ localBrowseError }}</p>
 
-            <div v-else class="file-tree-list">
-              <button
-                v-for="entry in localEntries"
+            <div
+              v-else
+              class="file-tree-list"
+              data-allow-app-context-menu="true"
+              @pointerdown="onTransferListPointerDown($event, 'local')"
+              @contextmenu.prevent="openTransferListContextMenu($event, 'local')"
+            >
+              <div class="file-tree-header">
+                <button
+                  type="button"
+                  class="file-tree-sort-btn file-tree-sort-name"
+                  :class="{ active: localEntrySort.key === 'name' }"
+                  :aria-pressed="localEntrySort.key === 'name'"
+                  :aria-label="fileEntrySortButtonLabel(localEntrySort, 'name', '名称')"
+                  :title="fileEntrySortButtonLabel(localEntrySort, 'name', '名称')"
+                  @click.stop="toggleFileEntrySort('local', 'name')"
+                >
+                  <span>名称</span>
+                  <svg class="file-tree-sort-indicator" :class="{ visible: localEntrySort.key === 'name' }" viewBox="0 0 24 24" aria-hidden="true">
+                    <path v-for="path in fileEntrySortIconPaths[fileEntrySortIconDirection(localEntrySort, 'name')]" :key="path" :d="path" />
+                  </svg>
+                </button>
+                <span class="file-entry-meta">
+                  <button
+                    type="button"
+                    class="file-tree-sort-btn file-entry-size"
+                    :class="{ active: localEntrySort.key === 'size' }"
+                    :aria-pressed="localEntrySort.key === 'size'"
+                    :aria-label="fileEntrySortButtonLabel(localEntrySort, 'size', '大小')"
+                    :title="fileEntrySortButtonLabel(localEntrySort, 'size', '大小')"
+                    @click.stop="toggleFileEntrySort('local', 'size')"
+                  >
+                    <span>大小</span>
+                    <svg class="file-tree-sort-indicator" :class="{ visible: localEntrySort.key === 'size' }" viewBox="0 0 24 24" aria-hidden="true">
+                      <path v-for="path in fileEntrySortIconPaths[fileEntrySortIconDirection(localEntrySort, 'size')]" :key="path" :d="path" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="file-tree-sort-btn file-entry-created"
+                    :class="{ active: localEntrySort.key === 'date' }"
+                    :aria-pressed="localEntrySort.key === 'date'"
+                    :aria-label="fileEntrySortButtonLabel(localEntrySort, 'date', '日期')"
+                    :title="fileEntrySortButtonLabel(localEntrySort, 'date', '日期')"
+                    @click.stop="toggleFileEntrySort('local', 'date')"
+                  >
+                    <span>日期</span>
+                    <svg class="file-tree-sort-indicator" :class="{ visible: localEntrySort.key === 'date' }" viewBox="0 0 24 24" aria-hidden="true">
+                      <path v-for="path in fileEntrySortIconPaths[fileEntrySortIconDirection(localEntrySort, 'date')]" :key="path" :d="path" />
+                    </svg>
+                  </button>
+                </span>
+              </div>
+              <div
+                v-for="entry in sortedLocalEntries"
                 :key="entry.path"
-                type="button"
                 class="file-tree-item"
+                data-allow-app-context-menu="true"
+                role="button"
+                tabindex="0"
                 :class="{ active: entry.path === selectedLocalPath }"
+                :data-entry-path="entry.path"
                 @click="selectLocalEntry(entry)"
                 @dblclick="enterLocalDirectory(entry)"
+                @keydown.enter.prevent="enterLocalDirectory(entry)"
               >
                 <span class="file-entry-main">
-                  <span class="file-entry-icon" :class="{ folder: entry.isDir, file: !entry.isDir }" aria-hidden="true"></span>
+                  <svg class="file-entry-icon" :class="fileEntryIconName(entry)" viewBox="0 0 24 24" aria-hidden="true">
+                    <path v-for="path in fileEntryIconPaths[fileEntryIconName(entry)]" :key="path" :d="path" />
+                  </svg>
                   <span class="file-entry-name mono">{{ entry.name }}</span>
                 </span>
-              </button>
+                <span class="file-entry-meta">
+                  <span class="file-entry-size mono">{{ formatEntrySize(entry) }}</span>
+                  <span class="file-entry-created mono">{{ formatEntryCreatedAt(entry) }}</span>
+                </span>
+              </div>
               <p class="empty-tree-state" v-if="localEntries.length === 0">当前目录为空</p>
             </div>
 
@@ -5976,31 +6631,123 @@ onBeforeUnmount(() => {
               ...
             </button>
 
-            <p class="helper" v-if="!selectedSerial">请先选择设备后浏览目录</p>
+            <div v-if="!selectedSerial" class="file-tree-list file-tree-list-empty">
+              <p class="empty-tree-state">请先选择设备后浏览目录</p>
+            </div>
             <p class="helper" v-else-if="browsingRemote">目录读取中...</p>
             <p class="helper" v-else-if="remoteBrowseError">{{ remoteBrowseError }}</p>
 
-            <div v-else class="file-tree-list">
-              <button
-                v-for="entry in remoteEntries"
+            <div
+              v-else
+              class="file-tree-list"
+              data-allow-app-context-menu="true"
+              @pointerdown="onTransferListPointerDown($event, 'remote')"
+              @contextmenu.prevent="openTransferListContextMenu($event, 'remote')"
+            >
+              <div class="file-tree-header">
+                <button
+                  type="button"
+                  class="file-tree-sort-btn file-tree-sort-name"
+                  :class="{ active: remoteEntrySort.key === 'name' }"
+                  :aria-pressed="remoteEntrySort.key === 'name'"
+                  :aria-label="fileEntrySortButtonLabel(remoteEntrySort, 'name', '名称')"
+                  :title="fileEntrySortButtonLabel(remoteEntrySort, 'name', '名称')"
+                  @click.stop="toggleFileEntrySort('remote', 'name')"
+                >
+                  <span>名称</span>
+                  <svg class="file-tree-sort-indicator" :class="{ visible: remoteEntrySort.key === 'name' }" viewBox="0 0 24 24" aria-hidden="true">
+                    <path v-for="path in fileEntrySortIconPaths[fileEntrySortIconDirection(remoteEntrySort, 'name')]" :key="path" :d="path" />
+                  </svg>
+                </button>
+                <span class="file-entry-meta">
+                  <button
+                    type="button"
+                    class="file-tree-sort-btn file-entry-size"
+                    :class="{ active: remoteEntrySort.key === 'size' }"
+                    :aria-pressed="remoteEntrySort.key === 'size'"
+                    :aria-label="fileEntrySortButtonLabel(remoteEntrySort, 'size', '大小')"
+                    :title="fileEntrySortButtonLabel(remoteEntrySort, 'size', '大小')"
+                    @click.stop="toggleFileEntrySort('remote', 'size')"
+                  >
+                    <span>大小</span>
+                    <svg class="file-tree-sort-indicator" :class="{ visible: remoteEntrySort.key === 'size' }" viewBox="0 0 24 24" aria-hidden="true">
+                      <path v-for="path in fileEntrySortIconPaths[fileEntrySortIconDirection(remoteEntrySort, 'size')]" :key="path" :d="path" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="file-tree-sort-btn file-entry-created"
+                    :class="{ active: remoteEntrySort.key === 'date' }"
+                    :aria-pressed="remoteEntrySort.key === 'date'"
+                    :aria-label="fileEntrySortButtonLabel(remoteEntrySort, 'date', '日期')"
+                    :title="fileEntrySortButtonLabel(remoteEntrySort, 'date', '日期')"
+                    @click.stop="toggleFileEntrySort('remote', 'date')"
+                  >
+                    <span>日期</span>
+                    <svg class="file-tree-sort-indicator" :class="{ visible: remoteEntrySort.key === 'date' }" viewBox="0 0 24 24" aria-hidden="true">
+                      <path v-for="path in fileEntrySortIconPaths[fileEntrySortIconDirection(remoteEntrySort, 'date')]" :key="path" :d="path" />
+                    </svg>
+                  </button>
+                </span>
+              </div>
+              <div
+                v-for="entry in sortedRemoteEntries"
                 :key="entry.path"
-                type="button"
                 class="file-tree-item"
+                data-allow-app-context-menu="true"
+                role="button"
+                tabindex="0"
                 :class="{ active: entry.path === selectedRemotePath }"
+                :data-entry-path="entry.path"
                 @click="selectRemoteEntry(entry)"
                 @dblclick="enterRemoteDirectory(entry)"
+                @keydown.enter.prevent="enterRemoteDirectory(entry)"
               >
                 <span class="file-entry-main">
-                  <span class="file-entry-icon" :class="{ folder: entry.isDir, file: !entry.isDir }" aria-hidden="true"></span>
+                  <svg class="file-entry-icon" :class="fileEntryIconName(entry)" viewBox="0 0 24 24" aria-hidden="true">
+                    <path v-for="path in fileEntryIconPaths[fileEntryIconName(entry)]" :key="path" :d="path" />
+                  </svg>
                   <span class="file-entry-name mono">{{ entry.name }}</span>
                 </span>
-              </button>
+                <span class="file-entry-meta">
+                  <span class="file-entry-size mono">{{ formatEntrySize(entry) }}</span>
+                  <span class="file-entry-created mono">{{ formatEntryCreatedAt(entry) }}</span>
+                </span>
+              </div>
               <p class="empty-tree-state" v-if="remoteEntries.length === 0">当前目录为空</p>
             </div>
 
           </div>
         </div>
       </section>
+
+      <Teleport to="body">
+        <div
+          v-if="transferContextMenu"
+          class="transfer-context-menu"
+          data-allow-app-context-menu="true"
+          :style="{ left: `${transferContextMenu.x}px`, top: `${transferContextMenu.y}px` }"
+          role="menu"
+          @click.stop
+          @contextmenu.prevent
+        >
+          <button
+            v-for="item in transferContextMenuItems"
+            :key="item.action"
+            type="button"
+            class="transfer-context-menu-item"
+            :class="{ danger: item.danger }"
+            :disabled="item.disabled"
+            role="menuitem"
+            @click="runTransferContextMenuAction(item.action)"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path v-for="path in transferToolIconPaths[item.icon]" :key="path" :d="path" />
+            </svg>
+            <span>{{ item.label }}</span>
+          </button>
+        </div>
+      </Teleport>
 
       <section v-if="settingsPanelOpen" v-show="activeWorkspaceTabKey === 'settings'" class="settings-dock">
         <SettingsPage />
@@ -6155,6 +6902,44 @@ onBeforeUnmount(() => {
   height: 100%;
   min-height: 0;
   overflow: hidden;
+}
+
+.mirror-file-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(15 23 42 / 0.36);
+  pointer-events: none;
+}
+
+.mirror-file-drop-panel {
+  display: grid;
+  gap: 6px;
+  width: min(360px, 100%);
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-main);
+  padding: 16px;
+  text-align: center;
+  box-shadow: 0 18px 45px rgb(15 23 42 / 0.22);
+}
+
+.mirror-file-drop-panel strong {
+  font-size: 15px;
+}
+
+.mirror-file-drop-panel span {
+  color: var(--text-sub);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.mirror-file-drop-overlay.busy .mirror-file-drop-panel {
+  border-color: var(--control-border);
 }
 
 .field-row {
@@ -6891,6 +7676,9 @@ onBeforeUnmount(() => {
 }
 
 .file-tree-list {
+  --file-tree-min-width: 520px;
+  --file-entry-size-width: 76px;
+  --file-entry-date-width: 142px;
   position: relative;
   min-height: 0;
   height: 100%;
@@ -6899,12 +7687,26 @@ onBeforeUnmount(() => {
   display: grid;
   align-content: start;
   border: 1px solid var(--border);
-  scrollbar-width: none;
+  scrollbar-width: thin;
 }
 
 .file-tree-list::-webkit-scrollbar {
-  width: 0;
-  height: 0;
+  width: 8px;
+  height: 8px;
+}
+
+.file-tree-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #cbd5e1;
+}
+
+.file-tree-list::-webkit-scrollbar-track {
+  background: #f8fafc;
+}
+
+.file-tree-list-empty {
+  align-content: stretch;
+  overflow: hidden;
 }
 
 .empty-tree-state {
@@ -6917,12 +7719,85 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
+.file-tree-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-width: var(--file-tree-min-width);
+  min-height: 27px;
+  border-bottom: 1px solid var(--border);
+  background: #f8fafc;
+  color: var(--text-sub);
+  padding: 5px 7px;
+  font-size: 10.5px;
+  box-sizing: border-box;
+}
+
+.file-tree-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font: inherit;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.file-tree-sort-btn:hover,
+.file-tree-sort-btn.active {
+  color: var(--primary);
+}
+
+.file-tree-sort-name {
+  min-width: 0;
+  flex: 1 1 auto;
+  justify-content: flex-start;
+  text-align: left;
+}
+
+.file-tree-header .file-entry-meta {
+  color: inherit;
+}
+
+.file-entry-meta .file-tree-sort-btn {
+  width: 100%;
+  justify-content: flex-end;
+  text-align: right;
+}
+
+.file-tree-sort-indicator {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  color: var(--primary);
+  fill: none;
+  opacity: 0;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.file-tree-sort-indicator.visible {
+  opacity: 1;
+}
+
 .file-tree-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
   width: 100%;
+  min-width: var(--file-tree-min-width);
   min-height: 30px;
   border: 0;
   border-bottom: 1px solid var(--border);
@@ -6931,6 +7806,7 @@ onBeforeUnmount(() => {
   padding: 5px 7px;
   text-align: left;
   cursor: pointer;
+  box-sizing: border-box;
 }
 
 .file-tree-item:hover,
@@ -6944,56 +7820,55 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 7px;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .file-entry-icon {
-  position: relative;
   width: 16px;
-  height: 14px;
+  height: 16px;
   flex: 0 0 16px;
   color: var(--text-sub);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
-.file-entry-icon.folder::before {
-  content: "";
-  position: absolute;
-  left: 1px;
-  top: 4px;
-  width: 14px;
-  height: 9px;
-  border: 1.5px solid currentColor;
-  border-radius: 2px;
+.file-entry-icon.folder {
+  color: #d97706;
 }
 
-.file-entry-icon.folder::after {
-  content: "";
-  position: absolute;
-  left: 2px;
-  top: 2px;
-  width: 7px;
-  height: 4px;
-  border: 1.5px solid currentColor;
-  border-bottom: 0;
-  border-radius: 2px 2px 0 0;
+.file-entry-icon.apk {
+  color: #16a34a;
 }
 
-.file-entry-icon.file::before {
-  content: "";
-  position: absolute;
-  inset: 1px 2px 1px 3px;
-  border: 1.5px solid currentColor;
-  border-radius: 2px;
+.file-entry-icon.image {
+  color: #0ea5e9;
 }
 
-.file-entry-icon.file::after {
-  content: "";
-  position: absolute;
-  right: 3px;
-  top: 2px;
-  width: 4px;
-  height: 4px;
-  border-top: 1.5px solid currentColor;
-  border-right: 1.5px solid currentColor;
+.file-entry-icon.video {
+  color: #db2777;
+}
+
+.file-entry-icon.pdf {
+  color: #dc2626;
+}
+
+.file-entry-icon.code {
+  color: #7c3aed;
+}
+
+.file-entry-icon.text {
+  color: #2563eb;
+}
+
+.file-entry-icon.archive {
+  color: #a16207;
+}
+
+.file-entry-icon.audio {
+  color: #0891b2;
 }
 
 .file-tree-item:hover .file-entry-icon,
@@ -7007,6 +7882,83 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-entry-meta {
+  display: grid;
+  grid-template-columns: var(--file-entry-size-width) var(--file-entry-date-width);
+  gap: 8px;
+  flex: 0 0 auto;
+  align-items: center;
+  color: var(--text-sub);
+  font-size: 10.5px;
+  text-align: right;
+}
+
+.file-entry-size,
+.file-entry-created {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.transfer-context-menu) {
+  position: fixed;
+  z-index: 2147483647;
+  display: grid;
+  min-width: 180px;
+  padding: 6px;
+  border: 1px solid var(--control-border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.18);
+}
+
+:global(.transfer-context-menu-item) {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 32px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--control-text);
+  padding: 0 9px;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+:global(.transfer-context-menu-item svg) {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+:global(.transfer-context-menu-item:hover:not(:disabled)) {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+:global(.transfer-context-menu-item.danger:not(:disabled)) {
+  color: #b91c1c;
+}
+
+:global(.transfer-context-menu-item.danger:hover:not(:disabled)) {
+  background: #fef2f2;
+  color: var(--danger);
+}
+
+:global(.transfer-context-menu-item:disabled) {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .text-preview-dock {

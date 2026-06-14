@@ -11,3 +11,4 @@ src-tauri/gen/
 src-tauri/.tauri/
 
 *-lock.json
+*-lock.yaml

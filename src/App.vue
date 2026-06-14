@@ -375,13 +375,24 @@ function onWindowClick(event: MouseEvent) {
   }
 }
 
+function shouldAllowContextMenu(event: MouseEvent | PointerEvent) {
+  const target = event.target instanceof HTMLElement ? event.target : null;
+  return Boolean(target?.closest("[data-allow-app-context-menu='true']"));
+}
+
 function disableContextMenu(event: MouseEvent) {
+  if (shouldAllowContextMenu(event)) {
+    return;
+  }
   event.stopPropagation();
   event.preventDefault();
 }
 
 function disableRightButtonPress(event: MouseEvent | PointerEvent) {
   if (event.button !== 2) {
+    return;
+  }
+  if (shouldAllowContextMenu(event)) {
     return;
   }
   event.stopPropagation();

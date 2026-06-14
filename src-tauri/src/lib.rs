@@ -11,8 +11,8 @@ use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use tauri::Manager;
 
@@ -241,6 +241,8 @@ struct SdcardEntry {
     name: String,
     path: String,
     is_dir: bool,
+    size_bytes: Option<u64>,
+    created_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -249,6 +251,8 @@ struct LocalEntry {
     name: String,
     path: String,
     is_dir: bool,
+    size_bytes: Option<u64>,
+    created_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -343,7 +347,7 @@ struct TerminalSpawnResult {
 #[serde(rename_all = "camelCase")]
 struct TerminalOutputPayload {
     session_id: u64,
-    data: String,
+    data_base64: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -352,6 +356,22 @@ struct TerminalExitPayload {
     session_id: u64,
     code: Option<u32>,
     message: String,
+}
+
+const TERMINAL_OUTPUT_FLUSH_MS: u64 = 8;
+const TERMINAL_OUTPUT_MAX_BATCH_BYTES: usize = 64 * 1024;
+const WINDOWS_DRIVES_ROOT_SENTINEL: &str = "__DROIDPILOT_WINDOWS_DRIVES__";
+
+fn emit_terminal_output(app: &tauri::AppHandle, session_id: u64, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let payload = TerminalOutputPayload {
+        session_id,
+        data_base64: general_purpose::STANDARD.encode(bytes),
+    };
+    let _ = app.emit_to("main", "terminal-output", payload);
 }
 
 /// 创建一个预配置的 adb Command，Windows 上自动隐藏控制台窗口。
@@ -715,6 +735,29 @@ fn remote_entry_name(path: &str) -> Option<&str> {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn system_time_to_millis(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn metadata_created_at_ms(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .created()
+        .or_else(|_| metadata.modified())
+        .ok()
+        .and_then(system_time_to_millis)
+}
+
+fn unix_seconds_to_millis(value: &str) -> Option<u64> {
+    let seconds = value.trim().parse::<i64>().ok()?;
+    if seconds <= 0 {
+        return None;
+    }
+    Some((seconds as u64).saturating_mul(1000))
 }
 
 fn is_allowed_device_storage_path(path: &str) -> bool {
@@ -1614,26 +1657,51 @@ async fn terminal_spawn(
     )?;
 
     let output_app = app.clone();
+    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(size) => {
-                    let payload = TerminalOutputPayload {
-                        session_id,
-                        data: String::from_utf8_lossy(&buffer[..size]).to_string(),
-                    };
-                    let _ = output_app.emit_to("main", "terminal-output", payload);
+                    if output_tx.send(buffer[..size].to_vec()).is_err() {
+                        break;
+                    }
                 }
                 Err(err) => {
-                    let payload = TerminalOutputPayload {
-                        session_id,
-                        data: format!("\r\n[terminal read error: {err}]\r\n"),
-                    };
-                    let _ = output_app.emit_to("main", "terminal-output", payload);
+                    let _ = output_tx.send(format!("\r\n[terminal read error: {err}]\r\n").into_bytes());
                     break;
                 }
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_MAX_BATCH_BYTES);
+        loop {
+            let first_chunk = match output_rx.recv() {
+                Ok(chunk) => chunk,
+                Err(_) => break,
+            };
+
+            pending.extend_from_slice(&first_chunk);
+            let mut disconnected = false;
+            while pending.len() < TERMINAL_OUTPUT_MAX_BATCH_BYTES {
+                match output_rx.recv_timeout(Duration::from_millis(TERMINAL_OUTPUT_FLUSH_MS)) {
+                    Ok(chunk) => pending.extend_from_slice(&chunk),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            emit_terminal_output(&output_app, session_id, &pending);
+            pending.clear();
+
+            if disconnected {
+                break;
             }
         }
     });
@@ -2227,7 +2295,39 @@ fn normalize_allowed_remote_file_path(path: String) -> Result<String, String> {
     Ok(target_path)
 }
 
+#[cfg(target_os = "windows")]
+fn list_windows_drive_entries() -> Vec<LocalEntry> {
+    let mut entries = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let name = format!("{}:", letter as char);
+        let path = format!("{name}\\");
+        if matches!(fs::metadata(&path), Ok(metadata) if metadata.is_dir()) {
+            entries.push(LocalEntry {
+                name,
+                path,
+                is_dir: true,
+                size_bytes: None,
+                created_at_ms: None,
+            });
+        }
+    }
+    entries
+}
+
+#[cfg(not(target_os = "windows"))]
+fn list_windows_drive_entries() -> Vec<LocalEntry> {
+    Vec::new()
+}
+
 fn list_local_entries_impl(path: Option<String>) -> Result<Vec<LocalEntry>, String> {
+    if path
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| value == WINDOWS_DRIVES_ROOT_SENTINEL)
+    {
+        return Ok(list_windows_drive_entries());
+    }
+
     let target_path = path
         .as_deref()
         .map(str::trim)
@@ -2262,6 +2362,12 @@ fn list_local_entries_impl(path: Option<String>) -> Result<Vec<LocalEntry>, Stri
             name,
             path: path.to_string_lossy().to_string(),
             is_dir: metadata.is_dir(),
+            size_bytes: if metadata.is_file() {
+                Some(metadata.len())
+            } else {
+                None
+            },
+            created_at_ms: metadata_created_at_ms(&metadata),
         });
     }
 
@@ -2284,6 +2390,72 @@ fn default_home_dir() -> Option<PathBuf> {
     {
         std::env::var_os("HOME").map(PathBuf::from)
     }
+}
+
+#[derive(Debug, Default)]
+struct RemoteEntryStat {
+    size_bytes: Option<u64>,
+    created_at_ms: Option<u64>,
+}
+
+fn remote_entry_stat_key(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn load_remote_entry_stats(
+    serial_value: &str,
+    entries: &[SdcardEntry],
+) -> HashMap<String, RemoteEntryStat> {
+    if entries.is_empty() {
+        return HashMap::new();
+    }
+
+    let quoted_paths = entries
+        .iter()
+        .map(|entry| shell_quote(&remote_entry_stat_key(&entry.path)))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if quoted_paths.is_empty() {
+        return HashMap::new();
+    }
+
+    let stat_format = shell_quote("%s\t%W\t%Y\t%n");
+    let fallback_stat_format = shell_quote("%s\t0\t%Y\t%n");
+    let script = format!(
+        "for p in {quoted_paths}; do stat -c {stat_format} \"$p\" 2>/dev/null || stat -c {fallback_stat_format} \"$p\" 2>/dev/null; done"
+    );
+    let output = match adb_command()
+        .args(["-s", serial_value, "shell", "sh", "-c", script.as_str()])
+        .output()
+    {
+        Ok(value) if value.status.success() => value,
+        _ => return HashMap::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim_end_matches('\r').splitn(4, '\t');
+            let size_bytes = parts.next()?.trim().parse::<u64>().ok();
+            let birth_at_ms = parts.next().and_then(unix_seconds_to_millis);
+            let modified_at_ms = parts.next().and_then(unix_seconds_to_millis);
+            let path = parts.next().map(remote_entry_stat_key)?;
+            Some((
+                path,
+                RemoteEntryStat {
+                    size_bytes,
+                    created_at_ms: birth_at_ms.or(modified_at_ms),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn list_sdcard_entries_impl(
@@ -2364,7 +2536,17 @@ fn list_sdcard_entries_impl(
             name,
             path: full_path,
             is_dir,
+            size_bytes: None,
+            created_at_ms: None,
         });
+    }
+
+    let stat_map = load_remote_entry_stats(serial_value, &entries);
+    for entry in &mut entries {
+        if let Some(stat) = stat_map.get(&remote_entry_stat_key(&entry.path)) {
+            entry.size_bytes = if entry.is_dir { None } else { stat.size_bytes };
+            entry.created_at_ms = stat.created_at_ms;
+        }
     }
 
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
