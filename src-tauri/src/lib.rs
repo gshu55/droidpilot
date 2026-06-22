@@ -131,10 +131,7 @@ fn get_adb_path() -> &'static PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_windows_window_frame<R: tauri::Runtime>(
-    window: &tauri::WebviewWindow<R>,
-    is_dark: bool,
-) {
+fn apply_windows_window_frame<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>, is_dark: bool) {
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 
     const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(34);
@@ -1669,7 +1666,8 @@ async fn terminal_spawn(
                     }
                 }
                 Err(err) => {
-                    let _ = output_tx.send(format!("\r\n[terminal read error: {err}]\r\n").into_bytes());
+                    let _ = output_tx
+                        .send(format!("\r\n[terminal read error: {err}]\r\n").into_bytes());
                     break;
                 }
             }
@@ -2398,6 +2396,9 @@ struct RemoteEntryStat {
     created_at_ms: Option<u64>,
 }
 
+const REMOTE_ENTRY_STAT_FORMAT: &str = "%s\t%W\t%Y\t%n";
+const REMOTE_ENTRY_STAT_FALLBACK_FORMAT: &str = "%s\t0\t%Y\t%n";
+
 fn remote_entry_stat_key(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -2407,35 +2408,58 @@ fn remote_entry_stat_key(path: &str) -> String {
     }
 }
 
+fn remote_entry_stat_args(
+    serial_value: &str,
+    entries: &[SdcardEntry],
+    include_birth_time: bool,
+) -> Option<Vec<String>> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let format = if include_birth_time {
+        REMOTE_ENTRY_STAT_FORMAT
+    } else {
+        REMOTE_ENTRY_STAT_FALLBACK_FORMAT
+    };
+    let mut args = Vec::with_capacity(entries.len() + 6);
+    args.push("-s".to_string());
+    args.push(serial_value.to_string());
+    args.push("exec-out".to_string());
+    args.push("stat".to_string());
+    args.push("-c".to_string());
+    args.push(format.to_string());
+    args.extend(
+        entries
+            .iter()
+            .map(|entry| remote_entry_stat_key(&entry.path)),
+    );
+    Some(args)
+}
+
+fn run_remote_entry_stat(
+    serial_value: &str,
+    entries: &[SdcardEntry],
+    include_birth_time: bool,
+) -> Option<Output> {
+    let args = remote_entry_stat_args(serial_value, entries, include_birth_time)?;
+    let output = adb_command().args(args).output().ok()?;
+    if output.status.success() || !output.stdout.is_empty() {
+        Some(output)
+    } else {
+        None
+    }
+}
+
 fn load_remote_entry_stats(
     serial_value: &str,
     entries: &[SdcardEntry],
 ) -> HashMap<String, RemoteEntryStat> {
-    if entries.is_empty() {
-        return HashMap::new();
-    }
-
-    let quoted_paths = entries
-        .iter()
-        .map(|entry| shell_quote(&remote_entry_stat_key(&entry.path)))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if quoted_paths.is_empty() {
-        return HashMap::new();
-    }
-
-    let stat_format = shell_quote("%s\t%W\t%Y\t%n");
-    let fallback_stat_format = shell_quote("%s\t0\t%Y\t%n");
-    let script = format!(
-        "for p in {quoted_paths}; do stat -c {stat_format} \"$p\" 2>/dev/null || stat -c {fallback_stat_format} \"$p\" 2>/dev/null; done"
-    );
-    let output = match adb_command()
-        .args(["-s", serial_value, "shell", "sh", "-c", script.as_str()])
-        .output()
+    let output = match run_remote_entry_stat(serial_value, entries, true)
+        .or_else(|| run_remote_entry_stat(serial_value, entries, false))
     {
-        Ok(value) if value.status.success() => value,
-        _ => return HashMap::new(),
+        Some(value) => value,
+        None => return HashMap::new(),
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2556,6 +2580,46 @@ fn list_sdcard_entries_impl(
     });
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_entry(name: &str, path: &str, is_dir: bool) -> SdcardEntry {
+        SdcardEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir,
+            size_bytes: None,
+            created_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn remote_entry_stat_args_use_exec_out_and_preserve_format_and_paths() {
+        let entries = vec![remote_entry(
+            "file with spaces.txt",
+            "/storage/emulated/0/Download/file with spaces.txt",
+            false,
+        )];
+
+        let args = remote_entry_stat_args("device-1", &entries, true).expect("stat args");
+
+        assert_eq!(
+            args,
+            vec![
+                "-s",
+                "device-1",
+                "exec-out",
+                "stat",
+                "-c",
+                "%s\t%W\t%Y\t%n",
+                "/storage/emulated/0/Download/file with spaces.txt",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "shell" || arg == "sh"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

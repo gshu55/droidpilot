@@ -12,6 +12,8 @@ import "@xterm/xterm/css/xterm.css";
 import { useAdbStore } from "../stores/adb";
 import { appShortcutDefinitions, appShortcutKeyParts, defaultAppShortcutMap, normalizeAppShortcutMap, type AppShortcut } from "../config/appShortcuts";
 import { useI18n } from "../i18n";
+import { formatBytes, formatEntrySize } from "../utils/fileEntryFormat";
+import { clampSplitPanePercent, splitPaneGridTemplateColumns } from "../utils/splitPane";
 import SettingsPage from "./SettingsPage.vue";
 
 const SYNTHETIC_PINCH_POINTER_A = 100_000;
@@ -307,6 +309,7 @@ const configuredAppShortcuts = computed(() => normalizeAppShortcutMap(adbStoreRe
 
 const mirrorTabListRef = ref<HTMLDivElement | null>(null);
 const terminalHostRef = ref<HTMLDivElement | null>(null);
+const transferBodyRef = ref<HTMLDivElement | null>(null);
 const transferPanelOpen = ref(false);
 const recording = ref(false);
 const recordingMirrorTabId = ref<number | null>(null);
@@ -327,6 +330,12 @@ const selectedRemotePath = ref("");
 const localEntrySort = ref<FileEntrySortState>({ key: "name", direction: "asc" });
 const remoteEntrySort = ref<FileEntrySortState>({ key: "name", direction: "asc" });
 const transferContextMenu = ref<TransferContextMenuState | null>(null);
+const transferPaneMinWidth = 300;
+const transferPaneHandleWidth = 8;
+const transferPaneSplitPercent = ref(50);
+const transferPaneResizeActive = ref(false);
+let transferPaneResizePointerId: number | null = null;
+let transferPaneResizeHandle: HTMLElement | null = null;
 const fileDropActive = ref(false);
 const fileDropBusy = ref(false);
 const fileDropMessage = ref("");
@@ -373,7 +382,7 @@ const terminalQuickGroup = ref<QuickCommandGroup>("common");
 const activeTerminalCommand = ref("");
 const terminalPanelOpen = ref(false);
 const settingsPanelOpen = ref(false);
-const commandPickerCollapsed = ref(false);
+const commandPickerCollapsed = ref(true);
 const imageEditorTabs = ref<ImageEditorTab[]>([]);
 const activeMirrorTabId = ref(0);
 const activeWorkspaceTabKey = ref("");
@@ -565,6 +574,13 @@ const deleteConfirmTitle = computed(() => (deleteConfirmTarget.value?.scope === 
 const canPreviewSelectedLocalText = computed(() => Boolean(selectedLocalPath.value && !selectedLocalEntry.value?.isDir && isPreviewablePath(selectedLocalPath.value)));
 const selectedRemoteEntry = computed(() => remoteEntries.value.find((entry) => entry.path === selectedRemotePath.value) || null);
 const canPreviewSelectedRemoteText = computed(() => Boolean(selectedRemotePath.value && selectedSerial.value && !selectedRemoteEntry.value?.isDir && isPreviewablePath(selectedRemotePath.value)));
+const transferPaneGridStyle = computed<Record<string, string>>(() => ({
+  "--transfer-pane-columns": splitPaneGridTemplateColumns(
+    transferPaneSplitPercent.value,
+    transferPaneMinWidth,
+    transferPaneHandleWidth,
+  ),
+}));
 const transferContextMenuItems = computed<TransferContextMenuItem[]>(() => {
   const menu = transferContextMenu.value;
   if (!menu) {
@@ -959,27 +975,6 @@ const fileEntryNameCollator = new Intl.Collator(undefined, {
   numeric: true,
   sensitivity: "base",
 });
-
-function formatBytes(value: number) {
-  if (!Number.isFinite(value) || value <= 0) {
-    return "0 B";
-  }
-  const units = ["B", "KB", "MB", "GB"];
-  let size = value;
-  let unitIndex = 0;
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024;
-    unitIndex += 1;
-  }
-  return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
-}
-
-function formatEntrySize(entry: TransferEntry) {
-  if (entry.isDir || typeof entry.sizeBytes !== "number") {
-    return "--";
-  }
-  return formatBytes(entry.sizeBytes);
-}
 
 function formatEntryCreatedAt(entry: TransferEntry) {
   const value = typeof entry.createdAtMs === "number" ? entry.createdAtMs : 0;
@@ -4625,6 +4620,86 @@ function onTransferListPointerDown(event: PointerEvent, scope: TransferEntryScop
   openTransferContextMenu(event, scope, entry);
 }
 
+function transferPanePercentFromClientX(clientX: number) {
+  const rect = transferBodyRef.value?.getBoundingClientRect();
+  if (!rect || rect.width <= 0) {
+    return transferPaneSplitPercent.value;
+  }
+
+  const availableWidth = Math.max(1, rect.width - transferPaneHandleWidth);
+  const localPaneWidth = clientX - rect.left - transferPaneHandleWidth / 2;
+  const nextPercent = (localPaneWidth / availableWidth) * 100;
+  return clampSplitPanePercent(nextPercent, rect.width, transferPaneMinWidth, transferPaneHandleWidth);
+}
+
+function updateTransferPaneSplitFromClientX(clientX: number) {
+  transferPaneSplitPercent.value = transferPanePercentFromClientX(clientX);
+}
+
+function startTransferPaneResize(event: PointerEvent) {
+  if (event.button !== 0) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  closeTransferContextMenu();
+  transferPaneResizeActive.value = true;
+  transferPaneResizePointerId = event.pointerId;
+  transferPaneResizeHandle = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  transferPaneResizeHandle?.setPointerCapture(event.pointerId);
+  updateTransferPaneSplitFromClientX(event.clientX);
+  window.addEventListener("pointermove", updateTransferPaneResize);
+  window.addEventListener("pointerup", stopTransferPaneResize);
+  window.addEventListener("pointercancel", stopTransferPaneResize);
+}
+
+function updateTransferPaneResize(event: PointerEvent) {
+  if (!transferPaneResizeActive.value || event.pointerId !== transferPaneResizePointerId) {
+    return;
+  }
+
+  event.preventDefault();
+  updateTransferPaneSplitFromClientX(event.clientX);
+}
+
+function stopTransferPaneResize(event?: PointerEvent) {
+  if (event && transferPaneResizePointerId !== null && event.pointerId !== transferPaneResizePointerId) {
+    return;
+  }
+
+  if (transferPaneResizePointerId !== null && transferPaneResizeHandle?.hasPointerCapture(transferPaneResizePointerId)) {
+    transferPaneResizeHandle.releasePointerCapture(transferPaneResizePointerId);
+  }
+  transferPaneResizeActive.value = false;
+  transferPaneResizePointerId = null;
+  transferPaneResizeHandle = null;
+  window.removeEventListener("pointermove", updateTransferPaneResize);
+  window.removeEventListener("pointerup", stopTransferPaneResize);
+  window.removeEventListener("pointercancel", stopTransferPaneResize);
+}
+
+function adjustTransferPaneSplit(delta: number) {
+  const rect = transferBodyRef.value?.getBoundingClientRect();
+  const width = rect?.width || 0;
+  transferPaneSplitPercent.value = clampSplitPanePercent(
+    transferPaneSplitPercent.value + delta,
+    width,
+    transferPaneMinWidth,
+    transferPaneHandleWidth,
+  );
+}
+
+function onTransferPaneResizerKeydown(event: KeyboardEvent) {
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    adjustTransferPaneSplit(-5);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    adjustTransferPaneSplit(5);
+  }
+}
+
 async function runTransferContextMenuAction(action: TransferMenuAction) {
   const menu = transferContextMenu.value;
   const item = transferContextMenuItems.value.find((current) => current.action === action);
@@ -6164,6 +6239,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", handleMirrorKeydown);
   window.removeEventListener("click", closeTransferContextMenu);
   window.removeEventListener("keydown", handleTransferContextMenuKeydown);
+  stopTransferPaneResize();
   unlistenFrame?.();
   unlistenStatus?.();
   unlistenTransferProgress?.();
@@ -6471,7 +6547,12 @@ onBeforeUnmount(() => {
       </div>
 
       <section v-if="transferPanelOpen" v-show="activeWorkspaceTabKey === 'transfer'" class="transfer-dock">
-        <div class="transfer-modal-body">
+        <div
+          ref="transferBodyRef"
+          class="transfer-modal-body"
+          :class="{ resizing: transferPaneResizeActive }"
+          :style="transferPaneGridStyle"
+        >
           <div class="file-pane system-pane">
             <div class="file-pane-head">
               <strong>系统目录</strong>
@@ -6509,10 +6590,6 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="file-path-bar mono">{{ localBrowserPathLabel }}</div>
-
-            <button type="button" class="file-parent-row mono" :disabled="!canGoLocalParent || browsingLocal" @dblclick="goLocalParentDirectory">
-              ...
-            </button>
 
             <p class="helper" v-if="browsingLocal">目录读取中...</p>
             <p class="helper" v-else-if="localBrowseError">{{ localBrowseError }}</p>
@@ -6570,6 +6647,9 @@ onBeforeUnmount(() => {
                   </button>
                 </span>
               </div>
+              <button type="button" class="file-parent-row mono" :disabled="!canGoLocalParent || browsingLocal" @dblclick="goLocalParentDirectory">
+                ...
+              </button>
               <div
                 v-for="entry in sortedLocalEntries"
                 :key="entry.path"
@@ -6599,6 +6679,22 @@ onBeforeUnmount(() => {
 
           </div>
 
+          <div
+            class="transfer-pane-resizer"
+            role="separator"
+            tabindex="0"
+            aria-label="调整系统目录和设备目录宽度"
+            aria-orientation="vertical"
+            :aria-valuenow="Math.round(transferPaneSplitPercent)"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            title="拖拽调整左右宽度"
+            @pointerdown="startTransferPaneResize"
+            @keydown="onTransferPaneResizerKeydown"
+          >
+            <span aria-hidden="true"></span>
+          </div>
+
           <div class="file-pane device-pane">
             <div class="file-pane-head">
               <strong>设备目录</strong>
@@ -6626,10 +6722,6 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="file-path-bar mono">{{ remoteBrowserPath }}</div>
-
-            <button type="button" class="file-parent-row mono" :disabled="atSdcardRoot || browsingRemote" @dblclick="goParentDirectory">
-              ...
-            </button>
 
             <div v-if="!selectedSerial" class="file-tree-list file-tree-list-empty">
               <p class="empty-tree-state">请先选择设备后浏览目录</p>
@@ -6690,6 +6782,9 @@ onBeforeUnmount(() => {
                   </button>
                 </span>
               </div>
+              <button type="button" class="file-parent-row mono" :disabled="atSdcardRoot || browsingRemote" @dblclick="goParentDirectory">
+                ...
+              </button>
               <div
                 v-for="entry in sortedRemoteEntries"
                 :key="entry.path"
@@ -7043,11 +7138,17 @@ onBeforeUnmount(() => {
 }
 
 .transfer-modal-body {
+  --transfer-pane-columns: minmax(300px, calc(50% - 4px)) 8px minmax(300px, 1fr);
   display: grid;
-  grid-template-columns: minmax(270px, 0.9fr) minmax(300px, 1.1fr);
+  grid-template-columns: var(--transfer-pane-columns);
   min-height: 0;
   height: 100%;
   overflow: hidden;
+}
+
+.transfer-modal-body.resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .terminal-dock {
@@ -7540,7 +7641,7 @@ onBeforeUnmount(() => {
 
 .file-pane {
   display: grid;
-  grid-template-rows: max-content max-content max-content minmax(0, 1fr);
+  grid-template-rows: max-content max-content minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -7553,8 +7654,53 @@ onBeforeUnmount(() => {
 }
 
 .device-pane {
-  border-left: 1px solid var(--border);
   padding-left: 10px;
+}
+
+.transfer-pane-resizer {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-width: 8px;
+  width: 8px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--border);
+  padding: 0;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.transfer-pane-resizer::before {
+  content: "";
+  width: 1px;
+  height: 100%;
+  background: currentColor;
+}
+
+.transfer-pane-resizer span {
+  position: absolute;
+  width: 4px;
+  height: 42px;
+  border-radius: 999px;
+  background: var(--control-border);
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.transfer-pane-resizer:hover,
+.transfer-pane-resizer:focus-visible,
+.transfer-modal-body.resizing .transfer-pane-resizer {
+  color: var(--primary-border);
+  outline: none;
+}
+
+.transfer-pane-resizer:hover span,
+.transfer-pane-resizer:focus-visible span,
+.transfer-modal-body.resizing .transfer-pane-resizer span {
+  background: var(--primary);
+  opacity: 1;
 }
 
 .file-pane-head {
@@ -7590,14 +7736,19 @@ onBeforeUnmount(() => {
 }
 
 .file-parent-row {
+  position: sticky;
+  top: var(--file-tree-header-height);
+  z-index: 1;
   width: 100%;
+  min-width: var(--file-tree-min-width);
   min-height: 28px;
-  border: 1px solid var(--border);
-  border-bottom: 0;
-  background: #f8fafc;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-alt);
   color: var(--control-text);
   padding: 4px 8px;
   text-align: left;
+  box-sizing: border-box;
   cursor: pointer;
 }
 
@@ -7677,6 +7828,7 @@ onBeforeUnmount(() => {
 
 .file-tree-list {
   --file-tree-min-width: 520px;
+  --file-tree-header-height: 27px;
   --file-entry-size-width: 76px;
   --file-entry-date-width: 142px;
   position: relative;
@@ -7722,16 +7874,16 @@ onBeforeUnmount(() => {
 .file-tree-header {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
   width: 100%;
   min-width: var(--file-tree-min-width);
-  min-height: 27px;
+  min-height: var(--file-tree-header-height);
   border-bottom: 1px solid var(--border);
-  background: #f8fafc;
+  background: var(--surface-alt);
   color: var(--text-sub);
   padding: 5px 7px;
   font-size: 10.5px;
@@ -8632,6 +8784,10 @@ onBeforeUnmount(() => {
     overflow: auto;
   }
 
+  .transfer-pane-resizer {
+    display: none;
+  }
+
   .terminal-dock {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(128px, 0.45fr) minmax(220px, 1fr);
@@ -8650,10 +8806,12 @@ onBeforeUnmount(() => {
 
   .system-pane {
     border-bottom: 1px solid var(--border);
+    padding-right: 0;
   }
 
   .device-pane {
     border-left: 0;
+    padding-left: 0;
   }
 
   .mirror-empty-shortcuts {
