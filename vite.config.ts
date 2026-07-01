@@ -1,17 +1,32 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+const require = createRequire(import.meta.url);
 const cargoToml = readFileSync(new URL("./src-tauri/Cargo.toml", import.meta.url), "utf-8");
 const cargoPackageVersion = cargoToml.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1];
+const fileViewerVue3PackagePath = require.resolve("@file-viewer/vue3/package.json");
+const fileViewerVue3Require = createRequire(fileViewerVue3PackagePath);
+const fileViewerCorePackagePath = fileViewerVue3Require.resolve("@file-viewer/core/package.json");
+const fileViewerSpreadsheetParserPath = join(
+  dirname(fileViewerCorePackagePath),
+  "dist/renderers/spreadsheet/worker/sheetjs/parser.js",
+);
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [vue()],
   define: {
     __APP_VERSION__: JSON.stringify(cargoPackageVersion ?? "unknown"),
+  },
+  resolve: {
+    alias: {
+      "@droidpilot/file-viewer-spreadsheet-parser": fileViewerSpreadsheetParserPath,
+    },
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

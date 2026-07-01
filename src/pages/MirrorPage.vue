@@ -8,13 +8,20 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { FileViewer, type FileViewerDocumentAnchor, type FileViewerExpose, type FileViewerOptions, type FileViewerSearchState, type FileViewerZoomState } from "@file-viewer/vue3";
+import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
+import spreadsheetWorkerUrl from "../workers/fileViewerSpreadsheet.worker?worker&url";
 import "@xterm/xterm/css/xterm.css";
+import "@file-viewer/vue3/dist/file-viewer3.css";
 import { useAdbStore } from "../stores/adb";
 import { appShortcutDefinitions, appShortcutKeyParts, defaultAppShortcutMap, normalizeAppShortcutMap, type AppShortcut } from "../config/appShortcuts";
 import { useI18n } from "../i18n";
 import { formatBytes, formatEntrySize } from "../utils/fileEntryFormat";
+import { fileExtension, filePreviewToolbarPosition, isFileViewerSearchPath, isImagePreviewPath, isPdfPreviewPath, isPreviewablePath, isTextPreviewPath, isVideoPreviewPath, shouldConfirmLargeFileViewerPreview } from "../utils/filePreview";
 import { clampSplitPanePercent, splitPaneGridTemplateColumns } from "../utils/splitPane";
 import SettingsPage from "./SettingsPage.vue";
+
+type PdfJsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 
 const SYNTHETIC_PINCH_POINTER_A = 100_000;
 const SYNTHETIC_PINCH_POINTER_B = 100_001;
@@ -119,20 +126,7 @@ interface TextPreviewMeta {
   sizeBytes: number;
 }
 
-interface TextPreviewChunk {
-  offset: number;
-  nextOffset: number;
-  sizeBytes: number;
-  text: string;
-  eof: boolean;
-}
-
 type TextPreviewSource = "local" | "remote";
-type TextPreviewMode = "text" | "html" | "pdf" | "image" | "video";
-interface TextPreviewLine {
-  id: number;
-  text: string;
-}
 
 interface PreviewFileResult {
   path: string;
@@ -140,8 +134,12 @@ interface PreviewFileResult {
   sizeBytes: number;
 }
 
-interface ImagePreviewResult extends PreviewFileResult {
-  dataUrl: string;
+interface PdfSearchMatch {
+  id: string;
+  index: number;
+  page: number;
+  text: string;
+  offset: number;
 }
 
 interface TerminalSpawnResult {
@@ -345,36 +343,25 @@ const copyProgressMessage = ref("");
 const deleteConfirmTarget = ref<DeleteConfirmTarget>(null);
 const textPreviewOpen = ref(false);
 const textPreviewSource = ref<TextPreviewSource>("local");
-const textPreviewMode = ref<TextPreviewMode>("text");
 const textPreviewMeta = ref<TextPreviewMeta | null>(null);
 const textPreviewAssetUrl = ref("");
-const textPreviewLines = ref<TextPreviewLine[]>([]);
-const textPreviewPendingLine = ref("");
-const textPreviewNextOffset = ref(0);
-const textPreviewEof = ref(false);
 const textPreviewLoading = ref(false);
 const textPreviewError = ref("");
-const textPreviewScrollTop = ref(0);
-const textPreviewViewportHeight = ref(220);
-const textPreviewBodyRef = ref<HTMLDivElement | null>(null);
+const fileViewerRef = ref<FileViewerExpose | null>(null);
+const fileViewerPreviewBodyRef = ref<HTMLDivElement | null>(null);
+const fileViewerDocumentLineCount = ref<number | null>(null);
+const fileViewerZoomState = ref<FileViewerZoomState | null>(null);
+const textPreviewCacheSummary = ref("");
 const textPreviewRequestId = ref(0);
 const textPreviewSearchQuery = ref("");
 const textPreviewSearchCaseSensitive = ref(false);
 const textPreviewSearchWholeWord = ref(false);
-const textPreviewSearchRegex = ref(false);
-const textPreviewSearchActiveLine = ref<number | null>(null);
+const fileViewerSearchState = ref<FileViewerSearchState | null>(null);
+const pdfSearchMatches = ref<PdfSearchMatch[]>([]);
+const pdfSearchCurrentIndex = ref(-1);
+const pdfSearchKey = ref("");
 const textPreviewSearchMessage = ref("");
 const textPreviewSearchSearching = ref(false);
-const imagePreviewScale = ref(1);
-const imagePreviewOffset = ref({ x: 0, y: 0 });
-const imagePreviewDragging = ref(false);
-let imagePreviewDragState: {
-  pointerId: number;
-  startX: number;
-  startY: number;
-  offsetX: number;
-  offsetY: number;
-} | null = null;
 const terminalSessionId = ref<number | null>(null);
 const terminalShell = ref("");
 const terminalStarting = ref(false);
@@ -399,6 +386,9 @@ let resolveMirrorEventListenersReady: (() => void) | null = null;
 let mirrorEventListenersReady = new Promise<void>((resolve) => {
   resolveMirrorEventListenersReady = resolve;
 });
+let fileViewerCacheSummaryObserver: MutationObserver | null = null;
+let fileViewerCacheSummarySyncTimer: number | null = null;
+let pdfJsModulePromise: Promise<PdfJsModule> | null = null;
 let localMediaRecorder: MediaRecorder | null = null;
 let localRecordingStream: MediaStream | null = null;
 let localRecordingChunks: Blob[] = [];
@@ -607,82 +597,66 @@ const transferContextMenuItems = computed<TransferContextMenuItem[]>(() => {
   ];
 });
 const recordingElapsedLabel = computed(() => formatDuration(recordingElapsedSeconds.value));
-const textPreviewLineHeight = 20;
-const textPreviewChunkSize = 256 * 1024;
-const textPreviewTotalHeight = computed(() => textPreviewLines.value.length * textPreviewLineHeight);
 const textPreviewSearchNeedle = computed(() => textPreviewSearchQuery.value.trim());
-const textPreviewSearchPattern = computed(() => {
-  const query = textPreviewSearchNeedle.value;
-  if (!query) {
-    return { query, regex: null as RegExp | null, error: "" };
-  }
-  try {
-    return { query, regex: buildTextPreviewSearchRegex(query), error: "" };
-  } catch (error) {
-    return {
-      query,
-      regex: null as RegExp | null,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+const textPreviewSearchAvailable = computed(() => isFileViewerSearchPath(textPreviewMeta.value?.name || ""));
+const textPreviewZoomAvailable = computed(() => {
+  const state = fileViewerZoomState.value;
+  return Boolean(state && (state.canZoomIn || state.canZoomOut || state.canReset));
 });
-const textPreviewSearchMatches = computed(() => {
-  const pattern = textPreviewSearchPattern.value;
-  if (!pattern.query || !pattern.regex || textPreviewMode.value !== "text") {
-    return [];
+const textPreviewZoomLabel = computed(() => fileViewerZoomState.value?.label || "100%");
+const textPreviewHeaderMetaItems = computed(() => {
+  const meta = textPreviewMeta.value;
+  const name = meta?.name || "";
+  const extension = fileExtension(name);
+  const items = [textPreviewSource.value === "local" ? "系统文件" : "设备文件"];
+  if (extension) {
+    items.push(extension.toUpperCase());
   }
-  return textPreviewLines.value
-    .filter((line) => textPreviewLineMatches(line.text))
-    .map((line) => line.id);
-});
-const textPreviewSearchActiveIndex = computed(() => {
-  if (textPreviewSearchActiveLine.value === null) {
-    return -1;
+  if (isTextPreviewPath(name) && fileViewerDocumentLineCount.value !== null) {
+    items.push(`${fileViewerDocumentLineCount.value} 行`);
   }
-  return textPreviewSearchMatches.value.indexOf(textPreviewSearchActiveLine.value);
+  items.push(meta ? formatBytes(meta.sizeBytes) : "读取中");
+  return items;
 });
 const textPreviewSearchLabel = computed(() => {
   const query = textPreviewSearchNeedle.value;
   if (!query) {
     return "";
   }
-  if (textPreviewSearchPattern.value.error) {
-    return "正则错误";
-  }
   if (textPreviewSearchSearching.value) {
     return "查找中";
   }
-  const matches = textPreviewSearchMatches.value.length;
-  if (matches === 0) {
-    return textPreviewSearchMessage.value || "0";
+  if (textPreviewSearchMessage.value) {
+    return textPreviewSearchMessage.value;
   }
-  const active = textPreviewSearchActiveIndex.value;
-  return active >= 0 ? `${active + 1}/${matches}` : `${matches}`;
+  const state = fileViewerSearchState.value;
+  if (!state || state.query !== query) {
+    return "";
+  }
+  if (state.total <= 0) {
+    return "0";
+  }
+  return state.currentIndex >= 0 ? `${state.currentIndex + 1}/${state.total}` : `${state.total}`;
 });
-const textPreviewVisibleRange = computed(() => {
-  const start = Math.max(0, Math.floor(textPreviewScrollTop.value / textPreviewLineHeight) - 8);
-  const count = Math.ceil(textPreviewViewportHeight.value / textPreviewLineHeight) + 16;
-  return {
-    start,
-    end: Math.min(textPreviewLines.value.length, start + count),
-  };
-});
-const textPreviewVisibleLines = computed(() => {
-  const range = textPreviewVisibleRange.value;
-  const hasSearch = Boolean(textPreviewSearchPattern.value.query && textPreviewSearchPattern.value.regex);
-  const activeLine = textPreviewSearchActiveLine.value;
-  return textPreviewLines.value.slice(range.start, range.end).map((line, index) => ({
-    ...line,
-    top: (range.start + index) * textPreviewLineHeight,
-    lineNumber: range.start + index + 1,
-    searchMatch: hasSearch && textPreviewLineMatches(line.text),
-    searchActive: activeLine === line.id,
-  }));
-});
-const textPreviewHtmlContent = computed(() => sanitizePreviewHtml(textPreviewLines.value.map((line) => line.text).join("\n")));
-const imagePreviewTransform = computed(() => {
-  return `translate(-50%, -50%) translate(${imagePreviewOffset.value.x}px, ${imagePreviewOffset.value.y}px) scale(${imagePreviewScale.value})`;
-});
+const filePreviewViewerOptions = computed<FileViewerOptions>(() => ({
+  theme: adbStore.theme,
+  toolbar: {
+    position: filePreviewToolbarPosition(textPreviewMeta.value?.name || ""),
+    download: false,
+    print: false,
+    exportHtml: false,
+    zoom: false,
+  },
+  search: {
+    enabled: textPreviewSearchAvailable.value,
+    caseSensitive: textPreviewSearchCaseSensitive.value,
+    wholeWord: textPreviewSearchWholeWord.value,
+    maxMatches: 2000,
+    debounce: 120,
+  },
+  pdf: { workerUrl: pdfWorkerUrl },
+  spreadsheet: { worker: true, workerUrl: spreadsheetWorkerUrl },
+}));
 const terminalQuickGroups: Array<{ key: QuickCommandGroup; label: string }> = [
   { key: "common", label: "常用" },
   { key: "device", label: "设备" },
@@ -1077,36 +1051,6 @@ function fileDropSummaryMessage(paths: string[]) {
   return `释放后复制 ${copyCount || paths.length} 个文件/目录到默认设备目录`;
 }
 
-function isTextPreviewPath(path: string) {
-  return /\.(txt|log|json|xml|yaml|yml|properties|csv|ini|conf|cfg|css|js|ts|vue|rs|kt|java|gradle|sh|bat|ps1)$/i.test(path.trim());
-}
-
-function isHtmlPreviewPath(path: string) {
-  return /\.(html|htm)$/i.test(path.trim());
-}
-
-function isPdfPreviewPath(path: string) {
-  return /\.pdf$/i.test(path.trim());
-}
-
-function isImagePreviewPath(path: string) {
-  return /\.(png|jpe?g|webp|gif|bmp|svg)$/i.test(path.trim());
-}
-
-function isVideoPreviewPath(path: string) {
-  return /\.(mp4|m4v|webm|mov|ogv|ogg|mkv|avi|3gp|3gpp)$/i.test(path.trim());
-}
-
-function isPreviewablePath(path: string) {
-  return isTextPreviewPath(path) || isHtmlPreviewPath(path) || isPdfPreviewPath(path) || isImagePreviewPath(path) || isVideoPreviewPath(path);
-}
-
-function fileExtension(path: string) {
-  const name = path.trim().split(/[\\/]/).pop() || "";
-  const dotIndex = name.lastIndexOf(".");
-  return dotIndex > 0 ? name.slice(dotIndex + 1).toLowerCase() : "";
-}
-
 function fileEntryIconName(entry: TransferEntry): FileEntryIconName {
   if (entry.isDir) {
     return "folder";
@@ -1138,39 +1082,6 @@ function fileEntryIconName(entry: TransferEntry): FileEntryIconName {
     return "text";
   }
   return "file";
-}
-
-function previewModeForPath(path: string): TextPreviewMode {
-  if (isVideoPreviewPath(path)) {
-    return "video";
-  }
-  if (isImagePreviewPath(path)) {
-    return "image";
-  }
-  if (isPdfPreviewPath(path)) {
-    return "pdf";
-  }
-  if (isHtmlPreviewPath(path)) {
-    return "html";
-  }
-  return "text";
-}
-
-function sanitizePreviewHtml(value: string) {
-  const parser = new DOMParser();
-  const documentValue = parser.parseFromString(value, "text/html");
-  const root = documentValue.body || documentValue.documentElement;
-  root.querySelectorAll("script, style, link, meta, iframe, object, embed").forEach((node) => node.remove());
-  root.querySelectorAll<HTMLElement>("*").forEach((node) => {
-    for (const attr of [...node.attributes]) {
-      const name = attr.name.toLowerCase();
-      const value = attr.value.trim().toLowerCase();
-      if (name === "style" || name.startsWith("on") || (["href", "src"].includes(name) && value.startsWith("javascript:"))) {
-        node.removeAttribute(attr.name);
-      }
-    }
-  });
-  return root.innerHTML;
 }
 
 async function ensureDownloadLocalDir() {
@@ -3222,15 +3133,6 @@ function activateWorkspaceTab(tab: WorkspaceTab) {
     });
     return;
   }
-  if (tab.kind === "textPreview") {
-    void nextTick(() => {
-      const element = textPreviewBodyRef.value;
-      if (element) {
-        textPreviewViewportHeight.value = element.clientHeight;
-      }
-    });
-    return;
-  }
   if (tab.kind === "terminal") {
     void nextTick(() => {
       createTerminalView();
@@ -4818,107 +4720,339 @@ function enterRemoteDirectory(entry: RemoteEntry) {
 }
 
 function resetTextPreviewState() {
-  textPreviewLines.value = [];
-  textPreviewPendingLine.value = "";
-  textPreviewNextOffset.value = 0;
-  textPreviewEof.value = false;
   textPreviewError.value = "";
   textPreviewAssetUrl.value = "";
-  textPreviewScrollTop.value = 0;
-  textPreviewBodyRef.value?.scrollTo({ top: 0 });
+  resetFileViewerDocumentSummary();
+  resetFileViewerZoomState();
+  resetFileViewerCacheSummary();
   resetTextPreviewSearch(true);
-  resetImagePreviewView();
+}
+
+function resetFileViewerDocumentSummary() {
+  fileViewerDocumentLineCount.value = null;
+}
+
+function resetFileViewerZoomState() {
+  fileViewerZoomState.value = null;
+}
+
+function syncFileViewerZoomState(viewer = fileViewerRef.value) {
+  fileViewerZoomState.value = viewer?.getZoomState() || null;
+}
+
+function stopFileViewerCacheSummaryObserver() {
+  fileViewerCacheSummaryObserver?.disconnect();
+  fileViewerCacheSummaryObserver = null;
+  if (fileViewerCacheSummarySyncTimer !== null) {
+    window.clearTimeout(fileViewerCacheSummarySyncTimer);
+    fileViewerCacheSummarySyncTimer = null;
+  }
+}
+
+function normalizeFileViewerCacheSummary(text: string) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function syncFileViewerCacheSummary() {
+  const summary = fileViewerPreviewBodyRef.value?.querySelector<HTMLElement>(".excel-wrapper .sheet-loading-summary");
+  textPreviewCacheSummary.value = normalizeFileViewerCacheSummary(summary?.textContent || "");
+}
+
+function scheduleFileViewerCacheSummarySync() {
+  if (fileViewerCacheSummarySyncTimer !== null) {
+    return;
+  }
+  fileViewerCacheSummarySyncTimer = window.setTimeout(() => {
+    fileViewerCacheSummarySyncTimer = null;
+    syncFileViewerCacheSummary();
+  }, 80);
+}
+
+function startFileViewerCacheSummaryObserver() {
+  stopFileViewerCacheSummaryObserver();
+  const root = fileViewerPreviewBodyRef.value;
+  syncFileViewerCacheSummary();
+  if (!root || typeof MutationObserver === "undefined") {
+    return;
+  }
+  fileViewerCacheSummaryObserver = new MutationObserver(scheduleFileViewerCacheSummarySync);
+  fileViewerCacheSummaryObserver.observe(root, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+}
+
+function resetFileViewerCacheSummary() {
+  stopFileViewerCacheSummaryObserver();
+  textPreviewCacheSummary.value = "";
+}
+
+function countFileViewerTextLines(text: string) {
+  return text.split(/\r\n|\r|\n/).length;
+}
+
+async function prepareFileViewerSearchIndex(viewer = fileViewerRef.value) {
+  if (!viewer) {
+    return [];
+  }
+  try {
+    return await viewer.collectDocumentAnchors();
+  } catch {
+    return [];
+  }
+}
+
+function resolveFileViewerDocumentLineCount(anchors: FileViewerDocumentAnchor[]) {
+  const textCounts = new Map<string, number>();
+  anchors.forEach((anchor) => {
+    const text = anchor.text || "";
+    if (!text.trim()) {
+      return;
+    }
+    textCounts.set(text, Math.max(textCounts.get(text) || 0, countFileViewerTextLines(text)));
+  });
+  const largestTextBlockLineCount = Math.max(0, ...textCounts.values());
+  if (largestTextBlockLineCount > 1) {
+    return largestTextBlockLineCount;
+  }
+
+  const lineAnchors = anchors.filter((anchor) => anchor.type === "line" && anchor.text.trim());
+  if (lineAnchors.length > 0) {
+    const uniqueLineTexts = new Set(lineAnchors.map((anchor) => anchor.text.trim()));
+    return uniqueLineTexts.size === 1 ? 1 : lineAnchors.length;
+  }
+  return anchors.length > 0 ? anchors.length : null;
+}
+
+async function onFileViewerLoadComplete() {
+  resetFileViewerDocumentSummary();
+  resetFileViewerZoomState();
+  resetFileViewerCacheSummary();
+  const requestId = textPreviewRequestId.value;
+  const previewName = textPreviewMeta.value?.name || "";
+  await nextTick();
+  if (textPreviewRequestId.value !== requestId || textPreviewMeta.value?.name !== previewName) {
+    return;
+  }
+  const viewer = fileViewerRef.value;
+  if (!viewer) {
+    return;
+  }
+  syncFileViewerZoomState(viewer);
+  startFileViewerCacheSummaryObserver();
+  const shouldCollectDocumentAnchors = isTextPreviewPath(previewName) || isFileViewerSearchPath(previewName);
+  if (!shouldCollectDocumentAnchors) {
+    return;
+  }
+  const anchors = await prepareFileViewerSearchIndex(viewer);
+  if (textPreviewRequestId.value !== requestId || textPreviewMeta.value?.name !== previewName) {
+    return;
+  }
+  if (isTextPreviewPath(previewName)) {
+    fileViewerDocumentLineCount.value = resolveFileViewerDocumentLineCount(anchors);
+  }
 }
 
 function resetTextPreviewSearch(clearQuery = false) {
   if (clearQuery) {
     textPreviewSearchQuery.value = "";
   }
-  textPreviewSearchActiveLine.value = null;
+  fileViewerSearchState.value = null;
+  resetPdfSearchFallback();
   textPreviewSearchMessage.value = "";
   textPreviewSearchSearching.value = false;
 }
 
-function resetImagePreviewView() {
-  imagePreviewScale.value = 1;
-  imagePreviewOffset.value = { x: 0, y: 0 };
-  imagePreviewDragging.value = false;
-  imagePreviewDragState = null;
+function resetPdfSearchFallback() {
+  pdfSearchMatches.value = [];
+  pdfSearchCurrentIndex.value = -1;
+  pdfSearchKey.value = "";
 }
 
-function onTextPreviewImageError() {
-  textPreviewError.value = "图片加载失败，请检查文件路径、权限或图片格式";
+function normalizePdfSearchText(value: string) {
+  return value.replace(/\s+/g, " ").trim();
 }
 
-function onTextPreviewVideoError() {
-  textPreviewError.value = "视频加载失败，请检查文件路径、权限、格式或编码";
+function escapePdfSearchRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function onTextPreviewImageWheel(event: WheelEvent) {
-  if (textPreviewMode.value !== "image" || !textPreviewAssetUrl.value) {
-    return;
+function createPdfSearchRegExp(needle: string) {
+  const normalizedNeedle = normalizePdfSearchText(needle);
+  const source = textPreviewSearchWholeWord.value
+    ? `\\b${escapePdfSearchRegExp(normalizedNeedle)}\\b`
+    : escapePdfSearchRegExp(normalizedNeedle);
+  return new RegExp(source, textPreviewSearchCaseSensitive.value ? "g" : "gi");
+}
+
+function getPdfSearchKey(needle: string) {
+  return [
+    textPreviewAssetUrl.value,
+    normalizePdfSearchText(needle),
+    textPreviewSearchCaseSensitive.value ? "case" : "ignore-case",
+    textPreviewSearchWholeWord.value ? "whole" : "partial",
+  ].join("\u0000");
+}
+
+function getPdfTextItemString(item: unknown) {
+  if (!item || typeof item !== "object" || !("str" in item)) {
+    return "";
   }
-  event.preventDefault();
-  const oldScale = imagePreviewScale.value;
-  const factor = Math.exp(-event.deltaY * 0.0012);
-  const nextScale = Math.min(8, Math.max(1, oldScale * factor));
-  if (nextScale === oldScale) {
-    return;
-  }
-
-  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-  const pointerX = event.clientX - rect.left - rect.width / 2;
-  const pointerY = event.clientY - rect.top - rect.height / 2;
-  const ratio = nextScale / oldScale;
-  const nextOffset = nextScale === 1
-    ? { x: 0, y: 0 }
-    : {
-      x: pointerX - (pointerX - imagePreviewOffset.value.x) * ratio,
-      y: pointerY - (pointerY - imagePreviewOffset.value.y) * ratio,
-    };
-
-  imagePreviewScale.value = nextScale;
-  imagePreviewOffset.value = nextOffset;
+  const text = (item as { str?: unknown }).str;
+  return typeof text === "string" ? text : "";
 }
 
-function onTextPreviewImagePointerDown(event: PointerEvent) {
-  if (textPreviewMode.value !== "image" || imagePreviewScale.value <= 1) {
-    return;
+function isCurrentPdfSearchRequest(requestId: number, assetUrl: string) {
+  return (
+    textPreviewRequestId.value === requestId &&
+    textPreviewAssetUrl.value === assetUrl &&
+    isPdfPreviewPath(textPreviewMeta.value?.name || "")
+  );
+}
+
+async function fetchPdfPreviewBuffer(assetUrl: string) {
+  const response = await fetch(assetUrl);
+  if (!response.ok && response.status !== 0) {
+    throw new Error(`PDF 文本读取失败：${response.status}`);
   }
-  event.preventDefault();
-  const target = event.currentTarget as HTMLElement;
-  target.setPointerCapture(event.pointerId);
-  imagePreviewDragging.value = true;
-  imagePreviewDragState = {
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    offsetX: imagePreviewOffset.value.x,
-    offsetY: imagePreviewOffset.value.y,
+  return response.arrayBuffer();
+}
+
+async function loadPdfJsForSearchFallback() {
+  if (!pdfJsModulePromise) {
+    pdfJsModulePromise = import("pdfjs-dist/legacy/build/pdf.mjs").then((module) => {
+      module.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+      return module;
+    });
+  }
+  return pdfJsModulePromise;
+}
+
+async function buildPdfSearchMatches(needle: string) {
+  const nextKey = getPdfSearchKey(needle);
+  if (pdfSearchKey.value === nextKey) {
+    return pdfSearchMatches.value;
+  }
+  const requestId = textPreviewRequestId.value;
+  const assetUrl = textPreviewAssetUrl.value;
+  if (!assetUrl || !isCurrentPdfSearchRequest(requestId, assetUrl)) {
+    resetPdfSearchFallback();
+    return [];
+  }
+
+  const buffer = await fetchPdfPreviewBuffer(assetUrl);
+  if (!isCurrentPdfSearchRequest(requestId, assetUrl)) {
+    return [];
+  }
+
+  const { getDocument: getPdfDocument } = await loadPdfJsForSearchFallback();
+  const loadingTask = getPdfDocument({
+    data: buffer,
+    cMapPacked: true,
+    useWorkerFetch: true,
+  });
+  const matches: PdfSearchMatch[] = [];
+  const maxMatches = 2000;
+  try {
+    const pdf = await loadingTask.promise;
+    for (let pageNumber = 1; pageNumber <= pdf.numPages && matches.length < maxMatches; pageNumber += 1) {
+      if (!isCurrentPdfSearchRequest(requestId, assetUrl)) {
+        return [];
+      }
+      const page = await pdf.getPage(pageNumber);
+      const textContent = await page.getTextContent();
+      const pageText = normalizePdfSearchText(textContent.items.map(getPdfTextItemString).filter(Boolean).join(" "));
+      if (!pageText) {
+        continue;
+      }
+      const expression = createPdfSearchRegExp(needle);
+      let match: RegExpExecArray | null = null;
+      while ((match = expression.exec(pageText)) && matches.length < maxMatches) {
+        if (!match[0]) {
+          expression.lastIndex += 1;
+          continue;
+        }
+        matches.push({
+          id: `pdf-fallback-search-${matches.length + 1}`,
+          index: matches.length,
+          page: pageNumber,
+          text: match[0],
+          offset: match.index,
+        });
+      }
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+
+  if (!isCurrentPdfSearchRequest(requestId, assetUrl)) {
+    return [];
+  }
+  pdfSearchKey.value = nextKey;
+  pdfSearchMatches.value = matches;
+  pdfSearchCurrentIndex.value = -1;
+  return matches;
+}
+
+function createPdfFallbackSearchState(query: string, matches: PdfSearchMatch[], currentIndex: number): FileViewerSearchState {
+  const currentMatch = currentIndex >= 0 ? matches[currentIndex] : null;
+  return {
+    query,
+    total: matches.length,
+    currentIndex: currentMatch ? currentMatch.index : -1,
+    current: currentMatch
+      ? {
+          id: currentMatch.id,
+          index: currentMatch.index,
+          text: currentMatch.text,
+          anchor: null,
+          page: currentMatch.page,
+        }
+      : null,
+    matches: matches.map((match) => ({
+      id: match.id,
+      index: match.index,
+      text: match.text,
+      anchor: null,
+      page: match.page,
+    })),
   };
 }
 
-function onTextPreviewImagePointerMove(event: PointerEvent) {
-  if (!imagePreviewDragState || imagePreviewDragState.pointerId !== event.pointerId) {
+function scrollToPdfSearchMatch(match: PdfSearchMatch | null) {
+  if (!match) {
     return;
   }
-  event.preventDefault();
-  imagePreviewOffset.value = {
-    x: imagePreviewDragState.offsetX + event.clientX - imagePreviewDragState.startX,
-    y: imagePreviewDragState.offsetY + event.clientY - imagePreviewDragState.startY,
-  };
+  const page = fileViewerPreviewBodyRef.value?.querySelector<HTMLElement>(`.pdfViewer .page[data-page-number="${match.page}"]`);
+  page?.scrollIntoView({ block: "center", inline: "nearest" });
 }
 
-function onTextPreviewImagePointerUp(event: PointerEvent) {
-  if (!imagePreviewDragState || imagePreviewDragState.pointerId !== event.pointerId) {
-    return;
+async function searchPdfPreviewFallback(needle: string, direction: 1 | -1) {
+  const currentKey = getPdfSearchKey(needle);
+  const wasSameSearch = pdfSearchKey.value === currentKey && pdfSearchMatches.value.length > 0;
+  const matches = await buildPdfSearchMatches(needle);
+  if (!matches.length) {
+    pdfSearchCurrentIndex.value = -1;
+    return createPdfFallbackSearchState(needle, matches, -1);
   }
-  const target = event.currentTarget as HTMLElement;
-  if (target.hasPointerCapture(event.pointerId)) {
-    target.releasePointerCapture(event.pointerId);
+
+  const nextIndex = wasSameSearch && pdfSearchCurrentIndex.value >= 0
+    ? (pdfSearchCurrentIndex.value + direction + matches.length) % matches.length
+    : direction < 0
+      ? matches.length - 1
+      : 0;
+  pdfSearchCurrentIndex.value = nextIndex;
+  scrollToPdfSearchMatch(matches[nextIndex]);
+  return createPdfFallbackSearchState(needle, matches, nextIndex);
+}
+
+function confirmLargeFileViewerPreview(meta: PreviewFileResult, source: TextPreviewSource) {
+  if (!shouldConfirmLargeFileViewerPreview("viewer", meta.sizeBytes)) {
+    return true;
   }
-  imagePreviewDragging.value = false;
-  imagePreviewDragState = null;
+  const sourceLabel = source === "local" ? "系统文件" : "设备文件";
+  return window.confirm(`${sourceLabel} ${meta.name} 大小为 ${formatBytes(meta.sizeBytes)}，文件预览可能占用较多内存并需要等待加载。是否继续预览？`);
 }
 
 async function openTextPreview(source: TextPreviewSource, path: string) {
@@ -4929,7 +5063,17 @@ async function openTextPreview(source: TextPreviewSource, path: string) {
     adbStore.setNotice("info", "当前文件类型暂不支持预览");
     return;
   }
-  const mode = previewModeForPath(path);
+  let viewerMeta: PreviewFileResult | null = null;
+  try {
+    viewerMeta = source === "local"
+      ? await invoke<TextPreviewMeta>("get_local_text_preview_meta", { path })
+      : await invoke<TextPreviewMeta>("get_remote_text_preview_meta", { serial: selectedSerial.value, path });
+    if (!confirmLargeFileViewerPreview(viewerMeta, source)) {
+      return;
+    }
+  } catch {
+    viewerMeta = null;
+  }
   const requestId = textPreviewRequestId.value + 1;
   const wasOpen = textPreviewOpen.value;
   textPreviewRequestId.value = requestId;
@@ -4940,89 +5084,34 @@ async function openTextPreview(source: TextPreviewSource, path: string) {
   activeWorkspaceTabKey.value = "text-preview";
   scrollWorkspaceTabIntoView("text-preview");
   textPreviewSource.value = source;
-  textPreviewMode.value = mode;
   textPreviewMeta.value = null;
   resetTextPreviewState();
   textPreviewLoading.value = true;
   try {
-    if (mode === "video") {
-      if (source === "local") {
-        const meta = await invoke<TextPreviewMeta>("get_local_text_preview_meta", { path });
-        if (textPreviewRequestId.value !== requestId) {
+    let result: PreviewFileResult;
+    if (source === "local") {
+      result = viewerMeta || await invoke<TextPreviewMeta>("get_local_text_preview_meta", { path });
+    } else {
+      if (!viewerMeta) {
+        viewerMeta = await invoke<TextPreviewMeta>("get_remote_text_preview_meta", { serial: selectedSerial.value, path });
+        if (!confirmLargeFileViewerPreview(viewerMeta, source)) {
+          closeTextPreview();
           return;
         }
-        textPreviewMeta.value = meta;
-        textPreviewAssetUrl.value = convertFileSrc(meta.path);
-      } else {
-        const localDir = await ensureDownloadLocalDir();
-        if (!localDir) {
-          textPreviewLoading.value = false;
-          return;
-        }
-        const result = await invoke<PreviewFileResult>("prepare_remote_preview_file", { serial: selectedSerial.value, path, localDir });
-        if (textPreviewRequestId.value !== requestId) {
-          return;
-        }
-        textPreviewMeta.value = result;
-        textPreviewAssetUrl.value = convertFileSrc(result.path);
       }
-      textPreviewLoading.value = false;
-      return;
-    }
-    if (mode === "image") {
-      let image: ImagePreviewResult;
-      if (source === "local") {
-        image = await invoke<ImagePreviewResult>("read_preview_image_data_url", { path });
-      } else {
-        const localDir = await ensureDownloadLocalDir();
-        if (!localDir) {
-          textPreviewLoading.value = false;
-          return;
-        }
-        const result = await invoke<PreviewFileResult>("prepare_remote_preview_file", { serial: selectedSerial.value, path, localDir });
-        image = await invoke<ImagePreviewResult>("read_preview_image_data_url", { path: result.path });
-      }
-      if (textPreviewRequestId.value !== requestId) {
+      const localDir = await ensureDownloadLocalDir();
+      if (!localDir) {
+        textPreviewLoading.value = false;
         return;
       }
-      textPreviewMeta.value = image;
-      textPreviewAssetUrl.value = image.dataUrl;
-      textPreviewLoading.value = false;
-      return;
+      result = await invoke<PreviewFileResult>("prepare_remote_preview_file", { serial: selectedSerial.value, path, localDir });
     }
-    if (mode === "pdf") {
-      if (source === "local") {
-        const meta = await invoke<TextPreviewMeta>("get_local_text_preview_meta", { path });
-        if (textPreviewRequestId.value !== requestId) {
-          return;
-        }
-        textPreviewMeta.value = meta;
-        textPreviewAssetUrl.value = convertFileSrc(meta.path);
-      } else {
-        const localDir = await ensureDownloadLocalDir();
-        if (!localDir) {
-          textPreviewLoading.value = false;
-          return;
-        }
-        const result = await invoke<PreviewFileResult>("prepare_remote_preview_file", { serial: selectedSerial.value, path, localDir });
-        if (textPreviewRequestId.value !== requestId) {
-          return;
-        }
-        textPreviewMeta.value = result;
-        textPreviewAssetUrl.value = convertFileSrc(result.path);
-      }
-      textPreviewLoading.value = false;
-      return;
-    }
-    const meta = source === "local"
-      ? await invoke<TextPreviewMeta>("get_local_text_preview_meta", { path })
-      : await invoke<TextPreviewMeta>("get_remote_text_preview_meta", { serial: selectedSerial.value, path });
     if (textPreviewRequestId.value !== requestId) {
       return;
     }
-    textPreviewMeta.value = meta;
+    textPreviewMeta.value = result;
+    textPreviewAssetUrl.value = convertFileSrc(result.path);
     textPreviewLoading.value = false;
-    await loadNextTextPreviewChunk();
   } catch (error) {
     if (textPreviewRequestId.value === requestId) {
       textPreviewError.value = String(error);
@@ -5045,225 +5134,151 @@ function closeTextPreview() {
   }
 }
 
-function appendTextPreviewChunk(chunk: TextPreviewChunk) {
-  const normalized = (textPreviewPendingLine.value + chunk.text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const parts = normalized.split("\n");
-  const completed = chunk.eof ? parts : parts.slice(0, -1);
-  textPreviewPendingLine.value = chunk.eof ? "" : parts[parts.length - 1] || "";
-  const startId = textPreviewLines.value.length;
-  textPreviewLines.value = [
-    ...textPreviewLines.value,
-    ...completed.map((text, index) => ({ id: startId + index, text })),
-  ];
-  textPreviewNextOffset.value = chunk.nextOffset;
-  textPreviewEof.value = chunk.eof;
-}
-
-async function loadNextTextPreviewChunk() {
-  const meta = textPreviewMeta.value;
-  if (!textPreviewOpen.value || !meta || textPreviewLoading.value || textPreviewEof.value) {
-    return false;
+async function clearFileViewerPreviewSearch() {
+  const viewer = fileViewerRef.value;
+  const clearingQuery = textPreviewSearchNeedle.value;
+  fileViewerSearchState.value = null;
+  if (!viewer) {
+    return;
   }
-  if (textPreviewMode.value === "pdf" || textPreviewMode.value === "image" || textPreviewMode.value === "video") {
-    return false;
-  }
-  const requestId = textPreviewRequestId.value;
-  textPreviewLoading.value = true;
-  textPreviewError.value = "";
-  let loaded = false;
   try {
-    const chunk = textPreviewSource.value === "local"
-      ? await invoke<TextPreviewChunk>("read_local_text_chunk", {
-        path: meta.path,
-        offset: textPreviewNextOffset.value,
-        length: textPreviewChunkSize,
-      })
-      : await invoke<TextPreviewChunk>("read_remote_text_chunk", {
-        serial: selectedSerial.value,
-        path: meta.path,
-        offset: textPreviewNextOffset.value,
-        length: textPreviewChunkSize,
-      });
-    if (textPreviewRequestId.value !== requestId) {
-      return false;
+    const state = await viewer.clearDocumentSearch();
+    if (!textPreviewSearchSearching.value && textPreviewSearchNeedle.value === clearingQuery) {
+      fileViewerSearchState.value = state;
     }
-    appendTextPreviewChunk(chunk);
-    loaded = true;
-  } catch (error) {
-    if (textPreviewRequestId.value === requestId) {
-      textPreviewError.value = String(error);
-    }
-  } finally {
-    if (textPreviewRequestId.value === requestId) {
-      textPreviewLoading.value = false;
-    }
+  } catch {
+    fileViewerSearchState.value = null;
   }
-  return loaded;
-}
-
-function onTextPreviewScroll(event: Event) {
-  const element = event.target as HTMLDivElement;
-  textPreviewScrollTop.value = element.scrollTop;
-  textPreviewViewportHeight.value = element.clientHeight;
-  if (element.scrollTop + element.clientHeight >= element.scrollHeight - 320) {
-    void loadNextTextPreviewChunk();
-  }
-}
-
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function buildTextPreviewSearchRegex(query: string) {
-  const flags = textPreviewSearchCaseSensitive.value ? "gu" : "giu";
-  const source = textPreviewSearchRegex.value ? query : escapeRegExp(query);
-  const boundedSource = textPreviewSearchWholeWord.value
-    ? `(?<![\\p{L}\\p{N}_])(?:${source})(?![\\p{L}\\p{N}_])`
-    : source;
-  return new RegExp(boundedSource, flags);
-}
-
-function textPreviewLineMatches(text: string) {
-  const regex = textPreviewSearchPattern.value.regex;
-  if (!regex) {
-    return false;
-  }
-  regex.lastIndex = 0;
-  return regex.test(text);
 }
 
 function onTextPreviewSearchInput() {
   resetTextPreviewSearch(false);
+  void clearFileViewerPreviewSearch();
 }
 
-function toggleTextPreviewSearchOption(option: "case" | "whole" | "regex") {
+function toggleTextPreviewSearchOption(option: "case" | "whole") {
   if (option === "case") {
     textPreviewSearchCaseSensitive.value = !textPreviewSearchCaseSensitive.value;
-  } else if (option === "whole") {
-    textPreviewSearchWholeWord.value = !textPreviewSearchWholeWord.value;
   } else {
-    textPreviewSearchRegex.value = !textPreviewSearchRegex.value;
+    textPreviewSearchWholeWord.value = !textPreviewSearchWholeWord.value;
   }
   resetTextPreviewSearch(false);
+  if (textPreviewSearchNeedle.value) {
+    void searchFileViewerPreview(1);
+  }
 }
 
 function onTextPreviewSearchKeydown(event: KeyboardEvent) {
   void searchTextPreview(event.shiftKey ? -1 : 1);
 }
 
-function findTextPreviewLoadedLine(startLine: number, direction: 1 | -1) {
-  if (!textPreviewSearchPattern.value.regex) {
-    return -1;
-  }
-  if (direction > 0) {
-    for (let index = Math.max(0, startLine); index < textPreviewLines.value.length; index++) {
-      if (textPreviewLineMatches(textPreviewLines.value[index]?.text || "")) {
-        return index;
-      }
-    }
-    return -1;
-  }
-  for (let index = Math.min(textPreviewLines.value.length - 1, startLine); index >= 0; index--) {
-    if (textPreviewLineMatches(textPreviewLines.value[index]?.text || "")) {
-      return index;
-    }
-  }
-  return -1;
-}
-
-function focusTextPreviewLine(lineIndex: number) {
-  textPreviewSearchActiveLine.value = lineIndex;
-  textPreviewSearchMessage.value = "";
-  const element = textPreviewBodyRef.value;
-  if (!element) {
+function onFileViewerSearchChange(state: FileViewerSearchState) {
+  fileViewerSearchState.value = state;
+  if (!state.query || state.query !== textPreviewSearchNeedle.value) {
     return;
   }
-  const targetTop = Math.max(0, lineIndex * textPreviewLineHeight - Math.floor(element.clientHeight * 0.35));
-  element.scrollTo({ top: targetTop, behavior: "smooth" });
-  textPreviewScrollTop.value = targetTop;
+  textPreviewSearchMessage.value = state.total <= 0 ? "未找到" : "";
 }
 
-async function searchTextPreview(direction: 1 | -1) {
-  if (textPreviewMode.value !== "text") {
+function onFileViewerZoomChange(state: FileViewerZoomState) {
+  fileViewerZoomState.value = state;
+}
+
+async function zoomTextPreview(action: "in" | "out" | "reset") {
+  const viewer = fileViewerRef.value;
+  if (!viewer) {
     return;
   }
+  try {
+    const state = action === "in"
+      ? await viewer.zoomIn()
+      : action === "out"
+        ? await viewer.zoomOut()
+        : await viewer.resetZoom();
+    fileViewerZoomState.value = state || viewer.getZoomState();
+  } catch {
+    syncFileViewerZoomState(viewer);
+  }
+}
+
+async function searchFileViewerPreview(direction: 1 | -1) {
   const needle = textPreviewSearchNeedle.value;
   if (!needle || textPreviewSearchSearching.value) {
     return;
   }
-  if (textPreviewSearchPattern.value.error || !textPreviewSearchPattern.value.regex) {
-    textPreviewSearchMessage.value = "正则错误";
-    textPreviewSearchActiveLine.value = null;
+  if (!textPreviewSearchAvailable.value) {
+    textPreviewSearchMessage.value = "不支持搜索";
+    fileViewerSearchState.value = null;
+    return;
+  }
+  const viewer = fileViewerRef.value;
+  if (!viewer) {
+    textPreviewSearchMessage.value = textPreviewLoading.value ? "加载中" : "未就绪";
+    fileViewerSearchState.value = null;
     return;
   }
 
   textPreviewSearchSearching.value = true;
   textPreviewSearchMessage.value = "";
   try {
-    const visibleStart = Math.floor(textPreviewScrollTop.value / textPreviewLineHeight);
-    const fromLine = textPreviewSearchActiveLine.value === null
-      ? visibleStart
-      : textPreviewSearchActiveLine.value + direction;
-    let found = findTextPreviewLoadedLine(fromLine, direction);
-
-    if (found < 0 && direction > 0) {
-      while (!textPreviewEof.value) {
-        const previousLength = textPreviewLines.value.length;
-        const loaded = await loadNextTextPreviewChunk();
-        if (!loaded || textPreviewLines.value.length <= previousLength) {
-          break;
-        }
-        found = findTextPreviewLoadedLine(previousLength, 1);
-        if (found >= 0) {
-          break;
-        }
+    const currentState = fileViewerSearchState.value;
+    let state = currentState?.query === needle
+      ? await (direction > 0 ? viewer.nextSearchResult() : viewer.previousSearchResult())
+      : await prepareFileViewerSearchIndex(viewer).then(() => viewer.searchDocument(needle));
+    if ((!state || state.total <= 0) && isPdfPreviewPath(textPreviewMeta.value?.name || "")) {
+      const fallbackState = await searchPdfPreviewFallback(needle, direction);
+      if (fallbackState.total > 0 || !state) {
+        state = fallbackState;
       }
     }
-
-    if (found < 0) {
-      const wrapStart = direction > 0 ? 0 : textPreviewLines.value.length - 1;
-      found = findTextPreviewLoadedLine(wrapStart, direction);
+    fileViewerSearchState.value = state;
+    if (!state || state.total <= 0) {
+      textPreviewSearchMessage.value = "未找到";
     }
-
-    if (found >= 0) {
-      focusTextPreviewLine(found);
-      return;
-    }
-
-    textPreviewSearchActiveLine.value = null;
-    textPreviewSearchMessage.value = textPreviewEof.value ? "未找到" : "未找到";
+  } catch {
+    textPreviewSearchMessage.value = "搜索失败";
+    fileViewerSearchState.value = null;
   } finally {
     textPreviewSearchSearching.value = false;
   }
 }
 
-function selectedTextInsideTextPreview() {
-  const selection = window.getSelection();
-  const root = textPreviewBodyRef.value;
-  if (!selection || selection.isCollapsed || !root) {
+async function searchTextPreview(direction: 1 | -1) {
+  return searchFileViewerPreview(direction);
+}
+
+function isSelectionNodeInsideTextPreview(node: Node | null) {
+  const root = fileViewerPreviewBodyRef.value;
+  return Boolean(root && node && root.contains(node));
+}
+
+function selectedTextPreviewText() {
+  if (!textPreviewOpen.value || activeWorkspaceTabKey.value !== "text-preview") {
     return "";
   }
-  const anchorNode = selection.anchorNode;
-  const focusNode = selection.focusNode;
-  if ((anchorNode && !root.contains(anchorNode)) || (focusNode && !root.contains(focusNode))) {
+  const root = fileViewerPreviewBodyRef.value;
+  const selection = window.getSelection();
+  if (!root || !selection || selection.isCollapsed || selection.rangeCount === 0) {
     return "";
+  }
+  if (!isSelectionNodeInsideTextPreview(selection.anchorNode) || !isSelectionNodeInsideTextPreview(selection.focusNode)) {
+    return "";
+  }
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    if (!root.contains(selection.getRangeAt(index).commonAncestorContainer)) {
+      return "";
+    }
   }
   return selection.toString();
 }
 
-async function copyTextPreviewSelection() {
-  const selectedText = selectedTextInsideTextPreview();
-  const text = selectedText || (textPreviewMode.value === "pdf" || textPreviewMode.value === "image" || textPreviewMode.value === "video"
-    ? ""
-    : textPreviewMode.value === "html"
-      ? textPreviewLines.value.map((line) => line.text).join("\n")
-      : textPreviewVisibleLines.value.map((line) => line.text).join("\n"));
-  if (!text) {
-    adbStore.setNotice("info", "没有可复制的文本");
+function handleTextPreviewCopy(event: ClipboardEvent) {
+  const text = selectedTextPreviewText();
+  if (!text || !event.clipboardData) {
     return;
   }
-  await copyTextToClipboard(text);
-  adbStore.setNotice("success", selectedText ? "已复制选中文本" : "已复制当前可见文本");
+  event.clipboardData.setData("text/plain", text);
+  event.preventDefault();
 }
 
 function requestDeleteSelectedLocalEntry() {
@@ -6193,6 +6208,7 @@ function handleMirrorKeydown(event: KeyboardEvent) {
 onMounted(async () => {
   window.addEventListener("droidpilot:mirror-toolbar-action", handleMirrorToolbarAction);
   window.addEventListener("keydown", handleMirrorKeydown);
+  window.addEventListener("copy", handleTextPreviewCopy);
   window.addEventListener("click", closeTransferContextMenu);
   window.addEventListener("keydown", handleTransferContextMenuKeydown);
   window.setTimeout(emitMirrorToolbarState, 0);
@@ -6237,6 +6253,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener("droidpilot:mirror-toolbar-action", handleMirrorToolbarAction);
   window.removeEventListener("keydown", handleMirrorKeydown);
+  window.removeEventListener("copy", handleTextPreviewCopy);
   window.removeEventListener("click", closeTransferContextMenu);
   window.removeEventListener("keydown", handleTransferContextMenuKeydown);
   stopTransferPaneResize();
@@ -6246,6 +6263,7 @@ onBeforeUnmount(() => {
   unlistenTerminalOutput?.();
   unlistenTerminalExit?.();
   unlistenFileDrop?.();
+  stopFileViewerCacheSummaryObserver();
   if (localMediaRecorder && localMediaRecorder.state !== "inactive") {
     stopRecordingTimer();
     localMediaRecorder.stop();
@@ -6852,15 +6870,22 @@ onBeforeUnmount(() => {
         v-if="textPreviewOpen"
         v-show="activeWorkspaceTabKey === 'text-preview'"
         class="text-preview-dock"
-        :class="{ 'html-preview-dock': textPreviewMode === 'html' }"
       >
         <header class="text-preview-head">
-          <div>
+          <div class="text-preview-title-row">
             <strong>{{ textPreviewMeta?.name || t("mirror.textPreview") }}</strong>
-            <span>{{ textPreviewSource === "local" ? "系统文件" : "设备文件" }} · {{ textPreviewMeta ? formatBytes(textPreviewMeta.sizeBytes) : "读取中" }}</span>
+            <div class="text-preview-meta-inline" aria-label="预览信息">
+              <span v-for="item in textPreviewHeaderMetaItems" :key="item">{{ item }}</span>
+            </div>
           </div>
           <div class="text-preview-actions">
-            <div v-if="textPreviewMode === 'text'" class="text-preview-search">
+            <span v-if="textPreviewCacheSummary" class="text-preview-cache-summary">{{ textPreviewCacheSummary }}</span>
+            <div v-if="textPreviewZoomAvailable" class="text-preview-zoom">
+              <button type="button" class="tiny-btn text-preview-zoom-btn" :disabled="!fileViewerZoomState?.canZoomOut" title="缩小" @click="zoomTextPreview('out')">−</button>
+              <button type="button" class="tiny-btn text-preview-zoom-meter" :disabled="!fileViewerZoomState?.canReset" title="还原比例" @click="zoomTextPreview('reset')">{{ textPreviewZoomLabel }}</button>
+              <button type="button" class="tiny-btn text-preview-zoom-btn" :disabled="!fileViewerZoomState?.canZoomIn" title="放大" @click="zoomTextPreview('in')">+</button>
+            </div>
+            <div v-if="textPreviewSearchAvailable" class="text-preview-search">
               <input
                 v-model="textPreviewSearchQuery"
                 type="search"
@@ -6882,94 +6907,31 @@ onBeforeUnmount(() => {
                 title="整词匹配"
                 @click="toggleTextPreviewSearchOption('whole')"
               >
-                <svg class="whole-word-icon" viewBox="0 0 28 20" aria-hidden="true">
-                  <path class="whole-word-boundary" d="M3.5 5.5v9" />
-                  <path class="whole-word-boundary" d="M24.5 5.5v9" />
-                  <path class="whole-word-letter" d="M7.2 13.8V9.2c0-1.45 1.05-2.42 2.75-2.42 1.62 0 2.58.86 2.58 2.28v4.74" />
-                  <path class="whole-word-letter" d="M12.52 10.32H9.48c-1.6 0-2.56.68-2.56 1.83 0 1.08.86 1.76 2.12 1.76 1.34 0 2.36-.76 3.48-1.93" />
-                  <path class="whole-word-letter" d="M16.4 6.2v7.6" />
-                  <path class="whole-word-letter" d="M16.4 9.18c.74-1.46 1.72-2.18 2.95-2.18 1.8 0 3.05 1.4 3.05 3.48 0 2.08-1.26 3.48-3.05 3.48-1.26 0-2.24-.72-2.95-2.16" />
-                  <path class="whole-word-underline" d="M6.1 16.5h15.8" />
+                <svg class="whole-word-icon" viewBox="0 0 1024 1024" aria-hidden="true">
+                  <path class="whole-word-icon-glyph" d="M387.657143 599.771429l65.828571 168.228571h73.142857l-219.428571-563.2h-73.142857L21.942857 760.685714v7.314286h73.142857l65.828572-168.228571h226.742857zM270.628571 277.942857c0 14.628571 7.314286 21.942857 7.314286 29.257143l80.457143 234.057143H175.542857l80.457143-234.057143c7.314286-7.314286 14.628571-14.628571 14.628571-29.257143zM548.571429 204.8v563.2h65.828571v-51.2c21.942857 36.571429 65.828571 58.514286 124.342857 58.514286h7.314286c102.4-7.314286 153.6-73.142857 160.914286-204.8-7.314286-138.971429-65.828571-212.114286-175.542858-219.428572-43.885714-7.314286-87.771429 14.628571-117.028571 51.2V204.8h-65.828571zM614.4 585.142857v-65.828571c7.314286-73.142857 36.571429-109.714286 102.4-117.028572 80.457143 0 117.028571 58.514286 124.342857 160.914286 0 102.4-36.571429 153.6-109.714286 160.914286-73.142857-7.314286-109.714286-51.2-117.028571-138.971429zM0 914.285714h1024v73.142857H0z" />
                 </svg>
               </button>
-              <button
-                type="button"
-                class="tiny-btn text-preview-search-toggle"
-                :class="{ active: textPreviewSearchRegex }"
-                title="正则匹配"
-                @click="toggleTextPreviewSearchOption('regex')"
-              >.*</button>
               <span>{{ textPreviewSearchLabel }}</span>
               <button type="button" class="tiny-btn text-preview-search-btn" :disabled="!textPreviewSearchNeedle || textPreviewSearchSearching" title="上一个" @click="searchTextPreview(-1)">↑</button>
               <button type="button" class="tiny-btn text-preview-search-btn" :disabled="!textPreviewSearchNeedle || textPreviewSearchSearching" title="下一个" @click="searchTextPreview(1)">↓</button>
             </div>
-            <button type="button" class="tiny-btn" @click="copyTextPreviewSelection">复制</button>
             <button type="button" class="tiny-btn" @click="closeTextPreview">关闭</button>
           </div>
         </header>
-        <div
-          v-if="textPreviewMode === 'text'"
-          ref="textPreviewBodyRef"
-          class="text-preview-body"
-          @scroll="onTextPreviewScroll"
-        >
-          <div class="text-preview-spacer" :style="{ height: `${textPreviewTotalHeight}px` }">
-            <div
-              v-for="line in textPreviewVisibleLines"
-              :key="line.id"
-              class="text-preview-line"
-              :class="{ 'search-match': line.searchMatch, 'search-active': line.searchActive }"
-              :style="{ transform: `translateY(${line.top}px)` }"
-            >
-              <span class="text-preview-line-number">{{ line.lineNumber }}</span>
-              <code>{{ line.text || " " }}</code>
-            </div>
-          </div>
-          <div v-if="textPreviewLoading && textPreviewLines.length === 0" class="text-preview-status">正在打开...</div>
-          <div v-else-if="textPreviewError" class="text-preview-status error">{{ textPreviewError }}</div>
-          <div v-else-if="textPreviewLines.length === 0" class="text-preview-status">暂无可显示文本</div>
-        </div>
-        <div
-          v-else-if="textPreviewMode === 'html'"
-          ref="textPreviewBodyRef"
-          class="html-preview-body"
-          @scroll="onTextPreviewScroll"
-        >
-          <article v-if="textPreviewLines.length > 0" class="html-preview-content" v-html="textPreviewHtmlContent"></article>
-          <div v-if="textPreviewLoading && textPreviewLines.length === 0" class="text-preview-status">正在打开...</div>
-          <div v-else-if="textPreviewError" class="text-preview-status error">{{ textPreviewError }}</div>
-          <div v-else-if="textPreviewLines.length === 0" class="text-preview-status">暂无可显示内容</div>
-        </div>
-        <div
-          v-else
-          class="pdf-preview-body"
-          :class="{ 'image-preview-body': textPreviewMode === 'image', dragging: imagePreviewDragging, zoomed: textPreviewMode === 'image' && imagePreviewScale > 1 }"
-          @wheel="onTextPreviewImageWheel"
-          @pointerdown="onTextPreviewImagePointerDown"
-          @pointermove="onTextPreviewImagePointerMove"
-          @pointerup="onTextPreviewImagePointerUp"
-          @pointercancel="onTextPreviewImagePointerUp"
-          @dblclick="resetImagePreviewView"
-        >
-          <iframe v-if="textPreviewMode === 'pdf' && textPreviewAssetUrl" :src="textPreviewAssetUrl" title="PDF 预览"></iframe>
-          <video
-            v-else-if="textPreviewMode === 'video' && textPreviewAssetUrl"
-            :src="textPreviewAssetUrl"
-            controls
-            preload="metadata"
-            @error="onTextPreviewVideoError"
-          ></video>
-          <img
-            v-else-if="textPreviewMode === 'image' && textPreviewAssetUrl"
-            :src="textPreviewAssetUrl"
-            :style="{ transform: imagePreviewTransform }"
-            alt="图片预览"
-            draggable="false"
-            @load="resetImagePreviewView"
-            @error="onTextPreviewImageError"
+        <div ref="fileViewerPreviewBodyRef" class="file-viewer-preview-body" data-allow-app-context-menu="true">
+          <FileViewer
+            v-if="textPreviewAssetUrl"
+            ref="fileViewerRef"
+            :key="textPreviewAssetUrl"
+            :url="textPreviewAssetUrl"
+            :options="filePreviewViewerOptions"
+            @load-complete="onFileViewerLoadComplete"
+            @search-change="onFileViewerSearchChange"
+            @zoom-change="onFileViewerZoomChange"
           />
           <div v-if="textPreviewLoading" class="text-preview-status">正在打开...</div>
           <div v-else-if="textPreviewError" class="text-preview-status error">{{ textPreviewError }}</div>
+          <div v-else-if="!textPreviewAssetUrl" class="text-preview-status">暂无可显示内容</div>
         </div>
       </section>
     </section>
@@ -8120,31 +8082,32 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-rows: max-content minmax(0, 1fr);
   min-height: 0;
-  border: 1px solid rgb(148 163 184 / 0.32);
+  border: 1px solid var(--dock-border);
   border-radius: 8px;
-  background: rgb(248 250 252 / 0.96);
+  background: var(--dock-bg);
   padding: 8px;
 }
 
-.text-preview-dock.html-preview-dock {
-  background: transparent;
-}
-
 .text-preview-head {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
   margin-bottom: 6px;
-}
-
-.text-preview-head > div:first-child {
-  display: grid;
-  gap: 2px;
   min-width: 0;
 }
 
-.text-preview-head strong {
+.text-preview-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.text-preview-title-row strong {
+  flex: 0 1 auto;
+  max-width: min(42vw, 420px);
   color: var(--text-main);
   font-size: 12px;
   overflow: hidden;
@@ -8152,31 +8115,123 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.text-preview-head span {
+.text-preview-meta-inline {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+  overflow: hidden;
   color: var(--text-sub);
   font-size: 11px;
+  white-space: nowrap;
+}
+
+.text-preview-meta-inline span {
+  flex: 0 0 auto;
+  color: inherit;
+}
+
+.text-preview-meta-inline span + span::before {
+  display: inline-block;
+  width: 3px;
+  height: 3px;
+  margin: 0 6px 2px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.55;
+  content: "";
+  vertical-align: middle;
 }
 
 .text-preview-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.text-preview-actions::-webkit-scrollbar {
+  display: none;
+}
+
+.text-preview-cache-summary {
   flex: 0 0 auto;
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.text-preview-zoom {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex: 0 0 auto;
+  min-width: 0;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  background: var(--control-bg);
+  overflow: hidden;
+}
+
+.text-preview-zoom :is(.text-preview-zoom-btn, .text-preview-zoom-meter) {
+  height: 26px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-sub);
+}
+
+.text-preview-zoom :is(.text-preview-zoom-btn, .text-preview-zoom-meter):hover:not(:disabled) {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.text-preview-zoom-btn {
+  width: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.text-preview-zoom-meter {
+  min-width: 50px;
+  border-left: 1px solid var(--control-border);
+  border-right: 1px solid var(--control-border);
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 800;
 }
 
 .text-preview-search {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 0;
+  flex: 0 0 auto;
   min-width: 0;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  background: var(--control-bg);
+  overflow: hidden;
+}
+
+.text-preview-search:focus-within {
+  border-color: var(--primary-border);
+  background: var(--control-bg-hover);
 }
 
 .text-preview-search input {
   width: 132px;
-  height: 28px;
-  border: 1px solid var(--control-border);
-  border-radius: 6px;
-  background: var(--control-bg);
+  height: 26px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: var(--control-text);
   padding: 0 8px;
   font-size: 12px;
@@ -8185,15 +8240,30 @@ onBeforeUnmount(() => {
 
 .text-preview-search input:focus {
   border-color: var(--primary-border);
-  background: #fff;
+  background: var(--control-bg-hover);
 }
 
 .text-preview-search span {
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-width: 42px;
+  border-left: 1px solid var(--control-border);
   color: var(--text-sub);
   font-size: 11px;
   text-align: center;
   white-space: nowrap;
+}
+
+.text-preview-search :is(.text-preview-search-toggle, .text-preview-search-btn) {
+  display: inline-grid;
+  place-items: center;
+  height: 26px;
+  border: 0;
+  border-left: 1px solid var(--control-border);
+  border-radius: 0;
+  background: transparent;
 }
 
 .text-preview-search-btn {
@@ -8214,89 +8284,19 @@ onBeforeUnmount(() => {
 }
 
 .whole-word-icon {
-  width: 22px;
-  height: 16px;
+  width: 13px;
+  height: 13px;
   display: block;
+  color: currentColor;
+  transform: translate(1px, -1px);
 }
 
-.whole-word-boundary,
-.whole-word-letter,
-.whole-word-underline {
-  fill: none;
+.whole-word-icon-glyph {
+  fill: currentColor;
   stroke: currentColor;
-  stroke-linecap: round;
+  stroke-width: 18px;
   stroke-linejoin: round;
-}
-
-.whole-word-boundary {
-  stroke-width: 1.45;
-  opacity: 0.62;
-}
-
-.whole-word-letter {
-  stroke-width: 1.55;
-}
-
-.whole-word-underline {
-  stroke-width: 1.65;
-}
-
-.text-preview-body {
-  position: relative;
-  min-height: 0;
-  overflow: auto;
-  border: 1px solid var(--border);
-  background: #0f172a;
-  color: #dbeafe;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  line-height: 20px;
-  user-select: text;
-}
-
-.text-preview-spacer {
-  position: relative;
-  min-height: 100%;
-}
-
-.text-preview-line {
-  position: absolute;
-  inset: 0 0 auto;
-  display: grid;
-  grid-template-columns: 56px minmax(0, 1fr);
-  height: 20px;
-  min-width: max-content;
-}
-
-.text-preview-line.search-match code {
-  background: rgb(250 204 21 / 0.18);
-  color: #fef3c7;
-}
-
-.text-preview-line.search-active code {
-  background: rgb(59 130 246 / 0.36);
-  color: #ffffff;
-  box-shadow: inset 3px 0 0 var(--primary);
-}
-
-.text-preview-line-number {
-  position: sticky;
-  left: 0;
-  z-index: 1;
-  border-right: 1px solid rgb(148 163 184 / 0.24);
-  background: #111827;
-  color: #64748b;
-  padding: 0 8px;
-  text-align: right;
-  user-select: none;
-}
-
-.text-preview-line code {
-  display: block;
-  padding: 0 10px;
-  color: inherit;
-  white-space: pre;
-  user-select: text;
+  paint-order: stroke fill;
 }
 
 .text-preview-status {
@@ -8305,175 +8305,146 @@ onBeforeUnmount(() => {
   bottom: 0;
   width: max-content;
   min-width: 100%;
-  background: rgb(15 23 42 / 0.9);
-  color: #93c5fd;
+  border-top: 1px solid var(--border);
+  background: var(--surface-solid);
+  color: var(--primary);
   padding: 3px 8px;
   font-size: 11px;
 }
 
 .text-preview-status.error {
-  color: #fecaca;
+  color: var(--danger-text);
 }
 
-.html-preview-body,
-.pdf-preview-body {
+.file-viewer-preview-body {
+  --file-viewer-toolbar-height: 45px;
   position: relative;
   min-height: 0;
-  overflow: auto;
   border: 1px solid var(--border);
-}
-
-.html-preview-body {
-  --html-preview-radius: 6px;
-  border-radius: var(--html-preview-radius);
-  background: transparent;
-}
-
-.pdf-preview-body {
-  background: #fff;
-}
-
-.html-preview-content {
-  max-width: 960px;
-  margin: 0 auto;
-  background: transparent;
-  padding: 18px 22px 32px;
-  color: #0f172a;
-  line-height: 1.65;
-  user-select: text;
-}
-
-.html-preview-content :deep(h1),
-.html-preview-content :deep(h2),
-.html-preview-content :deep(h3) {
-  margin: 1.1em 0 0.55em;
-  color: #0f172a;
-  line-height: 1.25;
-}
-
-.html-preview-content :deep(p) {
-  margin: 0.5em 0;
-}
-
-.html-preview-content :deep(section),
-.html-preview-content :deep(article),
-.html-preview-content :deep(div),
-.html-preview-content :deep(main),
-.html-preview-content :deep(aside),
-.html-preview-content :deep(header),
-.html-preview-content :deep(footer),
-.html-preview-content :deep(nav) {
-  border-radius: var(--html-preview-radius);
-}
-
-.html-preview-content :deep(img),
-.html-preview-content :deep(video),
-.html-preview-content :deep(canvas),
-.html-preview-content :deep(table) {
-  border-radius: var(--html-preview-radius);
   overflow: hidden;
+  border-radius: 6px;
+  background: var(--surface-solid);
 }
 
-.html-preview-content :deep(pre) {
-  overflow: auto;
-  border-radius: var(--html-preview-radius);
-  background: #0f172a;
-  color: #dbeafe;
-  padding: 10px 12px;
-}
-
-.html-preview-content :deep(code) {
-  border-radius: var(--html-preview-radius);
-  background: #eef2ff;
-  color: #1e3a8a;
-  padding: 1px 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.html-preview-content :deep(pre code) {
-  background: transparent;
-  color: inherit;
-  padding: 0;
-}
-
-.html-preview-content :deep(blockquote) {
-  margin: 0.8em 0;
-  border-left: 3px solid var(--primary);
-  border-radius: var(--html-preview-radius);
-  color: #475569;
-  padding: 6px 10px;
-}
-
-.html-preview-content :deep(a) {
-  color: var(--primary);
-  text-decoration: underline;
-}
-
-.pdf-preview-body {
-  display: grid;
-  place-items: center;
-  min-height: 0;
-  padding: 10px;
-}
-
-.pdf-preview-body iframe {
+.file-viewer-preview-body :deep(.file-viewer) {
   width: 100%;
   height: 100%;
-  min-height: 0;
-  border: 0;
-  background: #fff;
+  background: var(--surface-solid) !important;
+  color: var(--text-main);
 }
 
-.pdf-preview-body video {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  background: #020617;
-  outline: none;
+.file-viewer-preview-body :deep(.viewer-actions) {
+  display: none !important;
+  border-bottom-color: var(--border) !important;
+  background: var(--surface-solid) !important;
 }
 
-.pdf-preview-body img {
-  display: block;
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  box-shadow: 0 8px 28px rgb(15 23 42 / 0.14);
+.file-viewer-preview-body :deep(.viewer-content-shell),
+.file-viewer-preview-body :deep(.content) {
+  background: var(--surface-alt) !important;
+  color: var(--text-main);
+  user-select: text !important;
+  -webkit-user-select: text !important;
 }
 
-.image-preview-body {
-  display: block;
+.file-viewer-preview-body :deep(.content :is(
+  .code-viewer,
+  .code-viewer *,
+  .markdown-body,
+  .markdown-body *,
+  .data-viewer,
+  .data-viewer *,
+  .email-message-content,
+  .email-message-content *,
+  .email-text,
+  .umd-stage,
+  .umd-stage *,
+  .odf-page,
+  .odf-page *,
+  .flyfish-rtf-paper,
+  .flyfish-rtf-paper *,
+  .docx-fit-viewer,
+  .docx-fit-viewer *,
+  .msdoc-zoom-viewer,
+  .msdoc-zoom-viewer *
+)) {
+  cursor: text !important;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+.file-viewer-preview-body :deep(.archive-info) {
+  display: none !important;
+}
+
+.file-viewer-preview-body :deep(.code-toolbar) {
+  display: none !important;
+}
+
+.file-viewer-preview-body :deep(.pdf-toolbar-group--zoom) {
+  display: none !important;
+}
+
+.file-viewer-preview-body :deep(.textLayer) {
+  z-index: 3 !important;
+  pointer-events: auto !important;
+}
+
+.file-viewer-preview-body :deep(.textLayer :is(span, br)) {
+  cursor: text !important;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+.file-viewer-preview-body :deep(.textLayer ::selection) {
+  background: color-mix(in srgb, var(--primary) 36%, transparent) !important;
+}
+
+.file-viewer-preview-body :deep(.viewer-content-shell:has(.excel-wrapper)),
+.file-viewer-preview-body :deep(.content:has(.excel-wrapper)),
+.file-viewer-preview-body :deep(.excel-wrapper .table-wrapper) {
+  overflow: visible !important;
+}
+
+.file-viewer-preview-body :deep(.excel-wrapper .sheet-loading) {
+  display: none !important;
+}
+
+.file-viewer-preview-body :deep(.excel-wrapper .sheet-loading-summary) {
   overflow: hidden;
-  padding: 0;
-  cursor: zoom-in;
-  touch-action: none;
-  user-select: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.image-preview-body img {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: auto;
-  height: auto;
-  max-width: calc(100% - 20px);
-  max-height: calc(100% - 20px);
-  transform-origin: center;
-  will-change: transform;
-  user-select: none;
-  -webkit-user-drag: none;
-  transition: box-shadow 0.12s ease;
+.file-viewer-preview-body :deep(.excel-wrapper .sheet-loading > span:nth-child(2)) {
+  display: none !important;
 }
 
-.image-preview-body.zoomed {
-  cursor: grab;
-}
+@media (max-width: 720px) {
+  .text-preview-head {
+    gap: 6px;
+  }
 
-.image-preview-body.dragging {
-  cursor: grabbing;
-}
+  .text-preview-title-row {
+    gap: 6px;
+  }
 
-.image-preview-body.dragging img {
-  transition: none;
+  .text-preview-title-row strong {
+    max-width: 24vw;
+  }
+
+  .text-preview-meta-inline {
+    max-width: 28vw;
+  }
+
+  .text-preview-search input {
+    width: 96px;
+  }
+
+  .file-viewer-preview-body :deep(.excel-wrapper .sheet-loading) {
+    display: none !important;
+  }
+
 }
 
 .mirror-stage {

@@ -232,6 +232,28 @@ struct TransferProgressPayload {
     success: Option<bool>,
 }
 
+#[derive(Debug)]
+struct TransferAdbOutput {
+    success: bool,
+    status_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug)]
+struct DirectoryPushFailure {
+    local_path: String,
+    remote_path: String,
+    status: TransferAdbOutput,
+    full_command: String,
+}
+
+#[derive(Debug, Default)]
+struct DirectoryPushStats {
+    directories: usize,
+    files: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SdcardEntry {
@@ -730,6 +752,42 @@ fn remote_entry_name(path: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn join_remote_path(base: &str, child: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    let child = child.trim_start_matches('/').trim_end_matches('/');
+
+    if child.is_empty() {
+        return if base.is_empty() {
+            "/".to_string()
+        } else {
+            base.to_string()
+        };
+    }
+
+    if base.is_empty() || base == "/" {
+        format!("/{child}")
+    } else {
+        format!("{base}/{child}")
+    }
+}
+
+fn sanitize_remote_directory_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+        .collect::<String>();
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "folder".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn join_remote_directory(base: &str, directory_name: &str) -> String {
+    join_remote_path(base, &sanitize_remote_directory_name(directory_name))
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -946,9 +1004,11 @@ fn transfer_file_impl(
         return Err("路径中包含占位符，请先填写完整参数".to_string());
     }
 
-    if request.direction == "push" {
-        fs::metadata(local_path).map_err(|_| format!("本地路径不存在: {local_path}"))?;
-    }
+    let push_metadata = if request.direction == "push" {
+        Some(fs::metadata(local_path).map_err(|_| format!("本地路径不存在: {local_path}"))?)
+    } else {
+        None
+    };
 
     if request.direction == "pull" {
         fs::create_dir_all(local_path).map_err(|err| format!("创建本地目录失败: {err}"))?;
@@ -970,6 +1030,13 @@ fn transfer_file_impl(
 
     match request.direction.as_str() {
         "push" => {
+            if push_metadata
+                .as_ref()
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+            {
+                return push_directory_to_remote(&app, serial, Path::new(local_path), remote_path);
+            }
             args.push("push".to_string());
             args.push(local_path.to_string());
             args.push(remote_path.to_string());
@@ -995,45 +1062,16 @@ fn transfer_file_impl(
         None,
     );
 
-    let mut child = adb_command()
-        .args(args.iter().map(String::as_str))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("执行 adb 失败: {err}"))?;
+    let adb_output = run_transfer_adb_command(
+        &app,
+        &request.direction,
+        &effective_local_path,
+        remote_path,
+        &args,
+    )?;
 
-    let stdout_handle = child.stdout.take().map(|stdout| {
-        read_transfer_output(
-            stdout,
-            app.clone(),
-            request.direction.clone(),
-            effective_local_path.clone(),
-            remote_path.to_string(),
-        )
-    });
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        read_transfer_output(
-            stderr,
-            app.clone(),
-            request.direction.clone(),
-            effective_local_path.clone(),
-            remote_path.to_string(),
-        )
-    });
-
-    let status = child
-        .wait()
-        .map_err(|err| format!("等待 adb 结束失败: {err}"))?;
-
-    let stdout = stdout_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let stderr = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-
-    let success = status.success();
-    let status_code = status.code().unwrap_or(-1);
+    let success = adb_output.success;
+    let status_code = adb_output.status_code;
     let stdout = if success {
         if request.direction == "push" {
             "上传完成".to_string()
@@ -1041,12 +1079,12 @@ fn transfer_file_impl(
             format!("下载完成: {effective_local_path}")
         }
     } else {
-        stdout.trim().to_string()
+        adb_output.stdout.trim().to_string()
     };
     let stderr = if success {
         String::new()
     } else {
-        let message = stderr.trim();
+        let message = adb_output.stderr.trim();
         if message.is_empty() {
             format!("传输失败，退出码 {status_code}")
         } else {
@@ -1076,6 +1114,280 @@ fn transfer_file_impl(
         stderr,
         full_command: format!("adb {}", args.join(" ")),
     })
+}
+
+fn run_transfer_adb_command(
+    app: &tauri::AppHandle,
+    direction: &str,
+    local_path: &str,
+    remote_path: &str,
+    args: &[String],
+) -> Result<TransferAdbOutput, String> {
+    let mut child = adb_command()
+        .args(args.iter().map(String::as_str))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("执行 adb 失败: {err}"))?;
+
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        read_transfer_output(
+            stdout,
+            app.clone(),
+            direction.to_string(),
+            local_path.to_string(),
+            remote_path.to_string(),
+        )
+    });
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        read_transfer_output(
+            stderr,
+            app.clone(),
+            direction.to_string(),
+            local_path.to_string(),
+            remote_path.to_string(),
+        )
+    });
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("等待 adb 结束失败: {err}"))?;
+
+    Ok(TransferAdbOutput {
+        success: status.success(),
+        status_code: status.code().unwrap_or(-1),
+        stdout: stdout_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default(),
+        stderr: stderr_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default(),
+    })
+}
+
+fn adb_full_command(args: &[String]) -> String {
+    format!("adb {}", args.join(" "))
+}
+
+fn remote_mkdir_args(serial: &str, remote_dir: &str) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "shell".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        format!("mkdir -p {}", shell_quote(remote_dir)),
+    ]
+}
+
+fn push_file_args(serial: &str, local_file: &str, remote_file: &str) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "push".to_string(),
+        local_file.to_string(),
+        remote_file.to_string(),
+    ]
+}
+
+fn push_directory_to_remote(
+    app: &tauri::AppHandle,
+    serial: &str,
+    local_dir: &Path,
+    remote_base_path: &str,
+) -> Result<AdbExecResult, String> {
+    let local_path = local_dir.to_string_lossy().to_string();
+    let root_name = local_dir
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "folder".to_string());
+    let remote_root = join_remote_directory(remote_base_path, &root_name);
+    let full_command = format!("adb -s {serial} push {local_path} {remote_root}");
+    let mut stats = DirectoryPushStats::default();
+
+    emit_transfer_progress(
+        app,
+        "push",
+        &local_path,
+        &remote_root,
+        None,
+        "准备复制目录",
+        false,
+        None,
+    );
+
+    let mkdir_args = remote_mkdir_args(serial, &remote_root);
+    let mkdir_output =
+        run_transfer_adb_command(app, "push", &local_path, &remote_root, &mkdir_args)?;
+    if !mkdir_output.success {
+        return Ok(directory_push_failure_result(
+            app,
+            DirectoryPushFailure {
+                local_path,
+                remote_path: remote_root,
+                status: mkdir_output,
+                full_command: adb_full_command(&mkdir_args),
+            },
+        ));
+    }
+    stats.directories += 1;
+
+    if let Some(failure) =
+        push_directory_contents_to_remote(app, serial, local_dir, &remote_root, &mut stats)?
+    {
+        return Ok(directory_push_failure_result(app, failure));
+    }
+
+    emit_transfer_progress(
+        app,
+        "push",
+        &local_path,
+        &remote_root,
+        Some(100),
+        "复制完成",
+        true,
+        Some(true),
+    );
+
+    Ok(AdbExecResult {
+        success: true,
+        status_code: 0,
+        stdout: format!(
+            "上传完成: {local_path} -> {remote_root}，目录 {} 个，文件 {} 个",
+            stats.directories, stats.files
+        ),
+        stderr: String::new(),
+        full_command,
+    })
+}
+
+fn push_directory_contents_to_remote(
+    app: &tauri::AppHandle,
+    serial: &str,
+    local_dir: &Path,
+    remote_dir: &str,
+    stats: &mut DirectoryPushStats,
+) -> Result<Option<DirectoryPushFailure>, String> {
+    let mut entries = fs::read_dir(local_dir)
+        .map_err(|err| format!("读取本地目录失败 {}: {err}", local_dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("读取本地目录失败 {}: {err}", local_dir.display()))?;
+
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_string());
+
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("读取本地条目类型失败 {}: {err}", entry.path().display()))?;
+        let entry_path = entry.path();
+        let entry_name = entry.file_name().to_string_lossy().to_string();
+
+        if file_type.is_dir() {
+            let remote_child = join_remote_directory(remote_dir, &entry_name);
+            let local_child = entry_path.to_string_lossy().to_string();
+            let mkdir_args = remote_mkdir_args(serial, &remote_child);
+
+            emit_transfer_progress(
+                app,
+                "push",
+                &local_child,
+                &remote_child,
+                None,
+                "准备复制目录",
+                false,
+                None,
+            );
+
+            let mkdir_output =
+                run_transfer_adb_command(app, "push", &local_child, &remote_child, &mkdir_args)?;
+            if !mkdir_output.success {
+                return Ok(Some(DirectoryPushFailure {
+                    local_path: local_child,
+                    remote_path: remote_child,
+                    status: mkdir_output,
+                    full_command: adb_full_command(&mkdir_args),
+                }));
+            }
+
+            stats.directories += 1;
+            if let Some(failure) =
+                push_directory_contents_to_remote(app, serial, &entry_path, &remote_child, stats)?
+            {
+                return Ok(Some(failure));
+            }
+        } else if file_type.is_file() {
+            let local_file = entry_path.to_string_lossy().to_string();
+            let remote_file = join_remote_path(remote_dir, &entry_name);
+            let push_args = push_file_args(serial, &local_file, &remote_file);
+
+            emit_transfer_progress(
+                app,
+                "push",
+                &local_file,
+                &remote_file,
+                None,
+                "准备复制",
+                false,
+                None,
+            );
+
+            let push_output =
+                run_transfer_adb_command(app, "push", &local_file, &remote_file, &push_args)?;
+            if !push_output.success {
+                return Ok(Some(DirectoryPushFailure {
+                    local_path: local_file,
+                    remote_path: remote_file,
+                    status: push_output,
+                    full_command: adb_full_command(&push_args),
+                }));
+            }
+
+            stats.files += 1;
+        }
+    }
+
+    Ok(None)
+}
+
+fn directory_push_failure_result(
+    app: &tauri::AppHandle,
+    failure: DirectoryPushFailure,
+) -> AdbExecResult {
+    let DirectoryPushFailure {
+        local_path,
+        remote_path,
+        status,
+        full_command,
+    } = failure;
+    let status_code = status.status_code;
+    let stdout = status.stdout.trim().to_string();
+    let stderr = {
+        let message = status.stderr.trim();
+        if message.is_empty() {
+            format!("传输失败，退出码 {status_code}")
+        } else {
+            message.to_string()
+        }
+    };
+
+    emit_transfer_progress(
+        app,
+        "push",
+        &local_path,
+        &remote_path,
+        None,
+        "复制失败",
+        true,
+        Some(false),
+    );
+
+    AdbExecResult {
+        success: false,
+        status_code,
+        stdout,
+        stderr,
+        full_command,
+    }
 }
 
 fn emit_transfer_progress(
@@ -2619,6 +2931,40 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|arg| arg == "shell" || arg == "sh"));
+    }
+
+    #[test]
+    fn join_remote_path_handles_roots_and_slashes() {
+        assert_eq!(
+            join_remote_path("/sdcard/Download", "folder"),
+            "/sdcard/Download/folder"
+        );
+        assert_eq!(
+            join_remote_path("/sdcard/Download/", "folder"),
+            "/sdcard/Download/folder"
+        );
+        assert_eq!(join_remote_path("/", "folder"), "/folder");
+        assert_eq!(join_remote_path("/sdcard/Download", ""), "/sdcard/Download");
+    }
+
+    #[test]
+    fn sanitize_remote_directory_name_removes_special_characters() {
+        assert_eq!(
+            sanitize_remote_directory_name("测试 folder@2026#!"),
+            "测试folder2026"
+        );
+        assert_eq!(sanitize_remote_directory_name("a.b-c_d"), "a.b-c_d");
+        assert_eq!(sanitize_remote_directory_name("!!!"), "folder");
+        assert_eq!(sanitize_remote_directory_name(".."), "folder");
+    }
+
+    #[test]
+    fn join_remote_directory_sanitizes_each_segment() {
+        let first = join_remote_directory("/sdcard/Download", "A @dir");
+        let second = join_remote_directory(&first, "子 目录#1");
+
+        assert_eq!(first, "/sdcard/Download/Adir");
+        assert_eq!(second, "/sdcard/Download/Adir/子目录1");
     }
 }
 
