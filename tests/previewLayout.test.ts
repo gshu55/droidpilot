@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
 const mirrorPage = readFileSync(new URL("../src/pages/MirrorPage.vue", import.meta.url), "utf-8");
@@ -168,11 +168,64 @@ test("FileViewer built-in download print HTML and zoom toolbar actions are disab
 
 test("PDF previews provide a Vite-bundled PDF.js worker URL", () => {
   assert.equal(packageJson.dependencies["pdfjs-dist"], "6.0.227");
-  assert.match(mirrorPage, /import pdfWorkerUrl from "pdfjs-dist\/legacy\/build\/pdf\.worker\.mjs\?url";/);
+  assert.match(mirrorPage, /import pdfWorkerUrl from "pdfjs-dist\/legacy\/build\/pdf\.worker\.mjs\?worker&url";/);
   assert.match(
     mirrorPage,
-    /pdf:\s*\{\s*workerUrl:\s*pdfWorkerUrl,?\s*\}/s,
+    /pdf:\s*\{\s*workerUrl:\s*pdfWorkerUrl,\s*cMapUrl:\s*"\/vendor\/pdf\/cmaps\/",\s*wasmUrl:\s*"\/vendor\/pdf\/wasm\/",\s*standardFontDataUrl:\s*"\/vendor\/pdf\/standard_fonts\/",?\s*\}/s,
   );
+});
+
+test("PDF preview public assets are available for packaged Windows builds", () => {
+  const pdfVendorRoot = new URL("../public/vendor/pdf/", import.meta.url);
+  const cmaps = new URL("cmaps/", pdfVendorRoot);
+  const wasm = new URL("wasm/", pdfVendorRoot);
+  const standardFonts = new URL("standard_fonts/", pdfVendorRoot);
+
+  assert.equal(existsSync(cmaps), true, "missing public/vendor/pdf/cmaps");
+  assert.equal(existsSync(wasm), true, "missing public/vendor/pdf/wasm");
+  assert.equal(existsSync(standardFonts), true, "missing public/vendor/pdf/standard_fonts");
+  assert.ok(readdirSync(cmaps).some((name) => name.endsWith(".bcmap")), "missing PDF CMap files");
+  assert.ok(readdirSync(wasm).some((name) => name.endsWith(".wasm")), "missing PDF wasm files");
+  assert.ok(readdirSync(standardFonts).some((name) => name.endsWith(".ttf") || name.endsWith(".pfb")), "missing PDF standard font files");
+});
+
+test("FileViewer offline assets are configured for packaged Windows builds", () => {
+  assert.match(
+    mirrorPage,
+    /archive:\s*\{\s*workerUrl:\s*"\/vendor\/libarchive\/worker-bundle\.js",\s*wasmUrl:\s*"\/vendor\/libarchive\/libarchive\.wasm",?\s*\}/s,
+  );
+  assert.match(
+    mirrorPage,
+    /docx:\s*\{\s*worker:\s*true,\s*workerUrl:\s*"\/vendor\/docx\/docx\.worker\.js",\s*workerJsZipUrl:\s*"\/vendor\/docx\/jszip\.min\.js",?\s*\}/s,
+  );
+  assert.match(
+    mirrorPage,
+    /cad:\s*\{\s*wasmPath:\s*"\/wasm\/cad\/",\s*workerUrl:\s*"\/wasm\/cad\/dwg-worker\.js",\s*dwfWasmUrl:\s*"\/wasm\/cad\/dwfv-render\.wasm",?\s*\}/s,
+  );
+  assert.match(
+    mirrorPage,
+    /typst:\s*\{\s*compilerWasmUrl:\s*"\/wasm\/typst\/typst_ts_web_compiler_bg\.wasm",\s*rendererWasmUrl:\s*"\/wasm\/typst\/typst_ts_renderer_bg\.wasm",?\s*\}/s,
+  );
+  assert.match(mirrorPage, /data:\s*\{\s*sqlWasmUrl:\s*"\/wasm\/data\/sql-wasm\.wasm",?\s*\}/s);
+  assert.match(mirrorPage, /drawing:\s*\{\s*preferOfficial:\s*false,?\s*\}/s);
+
+  const requiredAssets = [
+    "../public/vendor/libarchive/worker-bundle.js",
+    "../public/vendor/libarchive/libarchive.wasm",
+    "../public/vendor/docx/docx.worker.js",
+    "../public/vendor/docx/jszip.min.js",
+    "../public/wasm/cad/libredwg-web.js",
+    "../public/wasm/cad/libredwg-web.wasm",
+    "../public/wasm/cad/dwg-worker.js",
+    "../public/wasm/cad/dwfv-render.wasm",
+    "../public/wasm/typst/typst_ts_web_compiler_bg.wasm",
+    "../public/wasm/typst/typst_ts_renderer_bg.wasm",
+    "../public/wasm/data/sql-wasm.wasm",
+  ];
+
+  for (const assetPath of requiredAssets) {
+    assert.equal(existsSync(new URL(assetPath, import.meta.url)), true, `missing ${assetPath}`);
+  }
 });
 
 test("PDF renderer internal zoom controls are hidden because the preview header owns zoom", () => {

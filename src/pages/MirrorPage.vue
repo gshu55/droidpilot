@@ -9,7 +9,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { FileViewer, type FileViewerDocumentAnchor, type FileViewerExpose, type FileViewerOptions, type FileViewerSearchState, type FileViewerZoomState } from "@file-viewer/vue3";
-import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
+import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?worker&url";
 import spreadsheetWorkerUrl from "../workers/fileViewerSpreadsheet.worker?worker&url";
 import "@xterm/xterm/css/xterm.css";
 import "@file-viewer/vue3/dist/file-viewer3.css";
@@ -654,8 +654,37 @@ const filePreviewViewerOptions = computed<FileViewerOptions>(() => ({
     maxMatches: 2000,
     debounce: 120,
   },
-  pdf: { workerUrl: pdfWorkerUrl },
+  pdf: {
+    workerUrl: pdfWorkerUrl,
+    cMapUrl: "/vendor/pdf/cmaps/",
+    wasmUrl: "/vendor/pdf/wasm/",
+    standardFontDataUrl: "/vendor/pdf/standard_fonts/",
+  },
+  archive: {
+    workerUrl: "/vendor/libarchive/worker-bundle.js",
+    wasmUrl: "/vendor/libarchive/libarchive.wasm",
+  },
+  docx: {
+    worker: true,
+    workerUrl: "/vendor/docx/docx.worker.js",
+    workerJsZipUrl: "/vendor/docx/jszip.min.js",
+  },
   spreadsheet: { worker: true, workerUrl: spreadsheetWorkerUrl },
+  cad: {
+    wasmPath: "/wasm/cad/",
+    workerUrl: "/wasm/cad/dwg-worker.js",
+    dwfWasmUrl: "/wasm/cad/dwfv-render.wasm",
+  },
+  typst: {
+    compilerWasmUrl: "/wasm/typst/typst_ts_web_compiler_bg.wasm",
+    rendererWasmUrl: "/wasm/typst/typst_ts_renderer_bg.wasm",
+  },
+  data: {
+    sqlWasmUrl: "/wasm/data/sql-wasm.wasm",
+  },
+  drawing: {
+    preferOfficial: false,
+  },
 }));
 const terminalQuickGroups: Array<{ key: QuickCommandGroup; label: string }> = [
   { key: "common", label: "常用" },
