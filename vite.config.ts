@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import { fileViewerRenderers } from "@file-viewer/vite-plugin";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -9,23 +10,34 @@ const host = process.env.TAURI_DEV_HOST;
 const require = createRequire(import.meta.url);
 const cargoToml = readFileSync(new URL("./src-tauri/Cargo.toml", import.meta.url), "utf-8");
 const cargoPackageVersion = cargoToml.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1];
-const fileViewerVue3PackagePath = require.resolve("@file-viewer/vue3/package.json");
-const fileViewerVue3Require = createRequire(fileViewerVue3PackagePath);
-const fileViewerCorePackagePath = fileViewerVue3Require.resolve("@file-viewer/core/package.json");
-const fileViewerSpreadsheetParserPath = join(
-  dirname(fileViewerCorePackagePath),
-  "dist/renderers/spreadsheet/worker/sheetjs/parser.js",
-);
+const fileViewerPresetAllPackagePath = require.resolve("@file-viewer/preset-all/package.json");
+const fileViewerPresetAllRequire = createRequire(fileViewerPresetAllPackagePath);
+const fileViewerRendererEpubPackagePath = fileViewerPresetAllRequire.resolve("@file-viewer/renderer-epub/package.json");
+const fileViewerRendererEpubRequire = createRequire(fileViewerRendererEpubPackagePath);
+const epubjsPackagePath = fileViewerRendererEpubRequire.resolve("epubjs/package.json");
+const epubjsRequire = createRequire(epubjsPackagePath);
+const jszipPackagePath = epubjsRequire.resolve("jszip/package.json");
+const fileViewerSpreadsheetWorkerSheetjsPath = require.resolve("@file-viewer/renderer-spreadsheet/worker/sheetjs");
+const jszipBrowserBundlePath = join(dirname(jszipPackagePath), "dist/jszip.min.js");
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [vue()],
+  plugins: [
+    vue(),
+    fileViewerRenderers({
+      preset: "all",
+      inject: false,
+      copyAssets: true,
+      chunkStrategy: "renderer",
+    }),
+  ],
   define: {
     __APP_VERSION__: JSON.stringify(cargoPackageVersion ?? "unknown"),
   },
   resolve: {
     alias: {
-      "@droidpilot/file-viewer-spreadsheet-parser": fileViewerSpreadsheetParserPath,
+      "@droidpilot/file-viewer-spreadsheet-worker-sheetjs": fileViewerSpreadsheetWorkerSheetjsPath,
+      "jszip/dist/jszip": jszipBrowserBundlePath,
     },
   },
 

@@ -280,7 +280,11 @@ test("unknown extension is not previewable", () => {
 });
 
 test("uses the standard Vue3 FileViewer package instead of the compatibility alias", () => {
-  assert.equal(packageJson.dependencies["@file-viewer/vue3"], "2.0.10");
+  assert.equal(packageJson.dependencies["@file-viewer/core"], "2.1.19");
+  assert.equal(packageJson.dependencies["@file-viewer/vue3"], "2.1.19");
+  assert.equal(packageJson.dependencies["@file-viewer/preset-all"], "2.1.19");
+  assert.equal(packageJson.devDependencies["@file-viewer/vite-plugin"], "2.1.19");
+  assert.equal(packageJson.pnpm, undefined);
   assert.equal(packageJson.dependencies.fileViewer3, undefined);
   assert.equal(packageJson.dependencies["file-viewer3"], undefined);
 });

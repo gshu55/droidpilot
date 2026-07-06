@@ -332,13 +332,29 @@ test("spreadsheet visual cache refill hint is hidden for every viewport", () => 
   assert.match(hintStyle, /display:\s*none\s*!important;/);
 });
 
-test("spreadsheet previews use a bundled worker instead of blocking the main thread", () => {
-  assert.match(viteConfig, /@droidpilot\/file-viewer-spreadsheet-parser/);
-  assert.match(viteConfig, /@file-viewer\/vue3\/package\.json/);
-  assert.match(spreadsheetWorker, /@droidpilot\/file-viewer-spreadsheet-parser/);
-  assert.match(spreadsheetWorker, /handleSpreadsheetWorkerRequest/);
+test("FileViewer uses the 2.x preset renderer stack without core private parser aliases", () => {
+  assert.equal(packageJson.dependencies["@file-viewer/vue3"], "2.1.19");
+  assert.equal(packageJson.dependencies["@file-viewer/preset-all"], "2.1.19");
+  assert.equal(packageJson.dependencies["@file-viewer/renderer-spreadsheet"], "2.1.19");
+  assert.equal(packageJson.devDependencies["@file-viewer/vite-plugin"], "2.1.19");
+  assert.match(viteConfig, /import \{ fileViewerRenderers \} from "@file-viewer\/vite-plugin";/);
+  assert.match(viteConfig, /fileViewerRenderers\(\{\s*preset:\s*"all",\s*inject:\s*false,\s*copyAssets:\s*true,/s);
+  assert.match(viteConfig, /require\.resolve\("@file-viewer\/renderer-spreadsheet\/worker\/sheetjs"\)/);
+  assert.match(viteConfig, /"@droidpilot\/file-viewer-spreadsheet-worker-sheetjs":\s*fileViewerSpreadsheetWorkerSheetjsPath/);
+  assert.match(viteConfig, /fileViewerPresetAllRequire\.resolve\("@file-viewer\/renderer-epub\/package\.json"\)/);
+  assert.match(viteConfig, /epubjsRequire\.resolve\("jszip\/package\.json"\)/);
+  assert.match(viteConfig, /"jszip\/dist\/jszip":\s*jszipBrowserBundlePath/);
+  assert.doesNotMatch(viteConfig, /@droidpilot\/file-viewer-spreadsheet-parser/);
+  assert.doesNotMatch(viteConfig, /fileViewerSpreadsheetParserPath/);
+  assert.doesNotMatch(viteConfig, /dist\/renderers\/spreadsheet\/worker\/sheetjs\/parser\.js/);
+  assert.match(mirrorPage, /import \{ fileViewerPresetAll \} from "@file-viewer\/preset-all";/);
   assert.match(mirrorPage, /\.\.\/workers\/fileViewerSpreadsheet\.worker\?worker&url/);
-  assert.match(mirrorPage, /spreadsheet:\s*\{\s*worker:\s*true,\s*workerUrl:\s*spreadsheetWorkerUrl,?\s*\}/s);
+  assert.match(mirrorPage, /preset:\s*fileViewerPresetAll,\s*rendererMode:\s*"replace",\s*autoRenderers:\s*false,/s);
+  assert.match(mirrorPage, /spreadsheet:\s*\{\s*worker:\s*"auto",\s*workerUrl:\s*spreadsheetWorkerUrl,?\s*\}/s);
+  assert.match(spreadsheetWorker, /@droidpilot\/file-viewer-spreadsheet-worker-sheetjs/);
+  assert.match(spreadsheetWorker, /handleSpreadsheetWorkerRequest/);
+  assert.doesNotMatch(spreadsheetWorker, /@droidpilot\/file-viewer-spreadsheet-parser/);
+  assert.doesNotMatch(spreadsheetWorker, /@file-viewer\/core/);
 });
 
 test("FileViewer text-like previews are wired to the shared search controls", () => {

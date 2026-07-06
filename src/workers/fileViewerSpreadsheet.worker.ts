@@ -1,9 +1,17 @@
 import {
   createSpreadsheetParserContext,
   handleSpreadsheetWorkerRequest,
-  type SpreadsheetWorkerRequest,
-  type SpreadsheetWorkerResponse,
-} from "@droidpilot/file-viewer-spreadsheet-parser";
+} from "@droidpilot/file-viewer-spreadsheet-worker-sheetjs";
+
+interface SpreadsheetWorkerRequest {
+  type: string;
+  payload?: Record<string, unknown>;
+}
+
+interface SpreadsheetWorkerResponse {
+  type: string;
+  payload?: Record<string, unknown>;
+}
 
 const ctx = self as unknown as {
   onmessage: ((message: MessageEvent<SpreadsheetWorkerRequest>) => void) | null;

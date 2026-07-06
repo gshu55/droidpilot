@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 dist/
 src-tauri/target/
 
@@ -12,3 +13,5 @@ src-tauri/.tauri/
 
 *-lock.json
 *-lock.yaml
+!package-lock.json
+!pnpm-lock.yaml

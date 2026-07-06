@@ -9,6 +9,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { FileViewer, type FileViewerDocumentAnchor, type FileViewerExpose, type FileViewerOptions, type FileViewerSearchState, type FileViewerZoomState } from "@file-viewer/vue3";
+import { fileViewerPresetAll } from "@file-viewer/preset-all";
 import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?worker&url";
 import spreadsheetWorkerUrl from "../workers/fileViewerSpreadsheet.worker?worker&url";
 import "@xterm/xterm/css/xterm.css";
@@ -639,6 +640,9 @@ const textPreviewSearchLabel = computed(() => {
   return state.currentIndex >= 0 ? `${state.currentIndex + 1}/${state.total}` : `${state.total}`;
 });
 const filePreviewViewerOptions = computed<FileViewerOptions>(() => ({
+  preset: fileViewerPresetAll,
+  rendererMode: "replace",
+  autoRenderers: false,
   theme: adbStore.theme,
   toolbar: {
     position: filePreviewToolbarPosition(textPreviewMeta.value?.name || ""),
@@ -669,7 +673,10 @@ const filePreviewViewerOptions = computed<FileViewerOptions>(() => ({
     workerUrl: "/vendor/docx/docx.worker.js",
     workerJsZipUrl: "/vendor/docx/jszip.min.js",
   },
-  spreadsheet: { worker: true, workerUrl: spreadsheetWorkerUrl },
+  spreadsheet: {
+    worker: "auto",
+    workerUrl: spreadsheetWorkerUrl,
+  },
   cad: {
     wasmPath: "/wasm/cad/",
     workerUrl: "/wasm/cad/dwg-worker.js",

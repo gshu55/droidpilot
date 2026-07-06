@@ -8,7 +8,7 @@ declare module "*.vue" {
   export default component;
 }
 
-declare module "@droidpilot/file-viewer-spreadsheet-parser" {
+declare module "@droidpilot/file-viewer-spreadsheet-worker-sheetjs" {
   export interface SpreadsheetParserContext {
     workbook: unknown;
     sheets: unknown[];
