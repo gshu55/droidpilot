@@ -760,20 +760,52 @@ const quickCommands = computed<QuickCommandItem[]>(() => {
     { group: "common", label: "ADB 版本", desc: "查看 adb 工具版本", command: "adb version", tag: "info" },
     { group: "common", label: "启动服务", desc: "启动 ADB server", command: "adb start-server", tag: "server" },
     { group: "common", label: "重启服务", desc: "停止并重新启动 ADB", command: "adb kill-server && adb start-server", tag: "server" },
+    {
+      group: "common",
+      label: "设备概览",
+      desc: "汇总型号、CPU、屏幕、内存、磁盘和系统版本",
+      command: adbTerminalCommand(`shell "${[
+        "echo '== 设备型号 ==' && getprop ro.product.manufacturer && getprop ro.product.model",
+        "echo '== Android 版本 ==' && getprop ro.build.version.release && getprop ro.build.version.sdk",
+        "echo '== CPU 型号 ==' && (grep -m 1 -E 'Hardware|Processor|model name|cpu model' /proc/cpuinfo || getprop ro.hardware || getprop ro.board.platform)",
+        "echo '== CPU 核心 ==' && ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | wc -l",
+        "echo '== 分辨率 ==' && wm size",
+        "echo '== DPI ==' && wm density",
+        "echo '== 内存大小 ==' && grep MemTotal /proc/meminfo",
+        "echo '== 磁盘大小 ==' && df -h /data",
+      ].join("; ")}"`),
+      tag: "info",
+    },
     { group: "common", label: "设备型号", desc: "读取设备型号", command: adbTerminalCommand("shell getprop ro.product.model"), tag: "prop" },
     { group: "common", label: "Android 版本", desc: "读取系统版本", command: adbTerminalCommand("shell getprop ro.build.version.release"), tag: "prop" },
-    { group: "common", label: "屏幕分辨率", desc: "查看当前物理分辨率", command: adbTerminalCommand("shell wm size"), tag: "wm" },
     { group: "common", label: "电池信息", desc: "查看电量与充电状态", command: adbTerminalCommand("shell dumpsys battery"), tag: "dump" },
     { group: "device", label: "设备厂商", desc: "读取品牌厂商", command: adbTerminalCommand("shell getprop ro.product.manufacturer"), tag: "prop" },
+    {
+      group: "device",
+      label: "CPU 型号",
+      desc: "读取 CPU 硬件型号",
+      command: adbTerminalCommand("shell \"grep -m 1 -E 'Hardware|Processor|model name|cpu model' /proc/cpuinfo || getprop ro.hardware || getprop ro.board.platform\""),
+      tag: "cpu",
+    },
+    {
+      group: "device",
+      label: "CPU 核心",
+      desc: "统计 CPU 核心数和在线核心",
+      command: adbTerminalCommand("shell 'echo 核心数: $(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | wc -l); echo 在线核心: $(cat /sys/devices/system/cpu/online 2>/dev/null || echo unknown)'"),
+      tag: "cpu",
+    },
     { group: "device", label: "CPU 架构", desc: "查看 ABI 架构", command: adbTerminalCommand("shell getprop ro.product.cpu.abi"), tag: "abi" },
     { group: "device", label: "设备序列号", desc: "读取序列号", command: adbTerminalCommand("get-serialno"), tag: "id" },
-    { group: "device", label: "内存信息", desc: "读取 /proc/meminfo", command: adbTerminalCommand("shell cat /proc/meminfo"), tag: "mem" },
-    { group: "device", label: "存储信息", desc: "查看分区空间", command: adbTerminalCommand("shell df -h"), tag: "disk" },
+    { group: "device", label: "内存大小", desc: "读取总内存", command: adbTerminalCommand("shell grep MemTotal /proc/meminfo"), tag: "mem" },
+    { group: "device", label: "内存信息", desc: "读取完整 /proc/meminfo", command: adbTerminalCommand("shell cat /proc/meminfo"), tag: "mem" },
+    { group: "device", label: "磁盘大小", desc: "查看 data 分区容量", command: adbTerminalCommand("shell df -h /data"), tag: "disk" },
+    { group: "device", label: "存储信息", desc: "查看全部分区空间", command: adbTerminalCommand("shell df -h"), tag: "disk" },
     { group: "device", label: "网络地址", desc: "查看设备 IP 路由", command: adbTerminalCommand("shell ip route"), tag: "net" },
     { group: "device", label: "Wi-Fi 连接", desc: "修改 IP:端口后回车", command: "adb connect 192.168.1.100:5555", tag: "wifi" },
     { group: "device", label: "Wi-Fi 断开", desc: "修改 IP:端口后回车", command: "adb disconnect 192.168.1.100:5555", tag: "wifi" },
     { group: "device", label: "无线配对", desc: "修改配对地址后回车", command: "adb pair 192.168.1.100:37099", tag: "pair" },
     { group: "device", label: "启用 5555", desc: "切换到 TCP/IP 调试", command: adbTerminalCommand("tcpip 5555"), tag: "tcpip" },
+    { group: "screen", label: "屏幕分辨率", desc: "查看当前物理分辨率", command: adbTerminalCommand("shell wm size"), tag: "wm" },
     { group: "screen", label: "屏幕密度", desc: "查看当前 DPI", command: adbTerminalCommand("shell wm density"), tag: "wm" },
     { group: "screen", label: "窗口信息", desc: "查看窗口与焦点信息", command: adbTerminalCommand("shell dumpsys window"), tag: "dump" },
     { group: "screen", label: "返回键", desc: "发送返回按键", command: adbTerminalCommand("shell input keyevent 4"), tag: "key" },
@@ -5910,6 +5942,42 @@ async function writeTerminalData(data: string) {
   }
 }
 
+async function readTerminalClipboardText() {
+  const nativeText = await invoke<string>("read_text_clipboard").catch(() => null);
+  const browserText = nativeText === null && navigator.clipboard?.readText
+    ? await navigator.clipboard.readText().catch(() => null)
+    : null;
+  if (nativeText !== null || browserText !== null) {
+    return nativeText ?? browserText ?? "";
+  }
+  adbStore.setNotice("error", "无法读取剪贴板，请使用 Ctrl/Command+V 粘贴");
+  return "";
+}
+
+async function pasteClipboardTextToTerminal() {
+  const text = await readTerminalClipboardText();
+  if (!text) {
+    focusTerminalView();
+    return;
+  }
+  await writeTerminalData(text);
+}
+
+async function handleTerminalContextMenu() {
+  const selection = terminal?.getSelection().trim() || "";
+  if (selection) {
+    const copied = await copyTextToClipboard(selection);
+    if (copied) {
+      adbStore.setNotice("success", "已复制终端选中内容");
+    } else {
+      adbStore.setNotice("error", "复制终端选中内容失败");
+    }
+    focusTerminalView();
+    return;
+  }
+  await pasteClipboardTextToTerminal();
+}
+
 function scheduleTerminalResize() {
   if (terminalResizeTimer !== null) {
     window.clearTimeout(terminalResizeTimer);
@@ -6155,20 +6223,25 @@ function copyTextFallback(text: string) {
   textarea.style.top = "0";
   document.body.appendChild(textarea);
   textarea.select();
-  document.execCommand("copy");
-  textarea.remove();
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    textarea.remove();
+  }
 }
 
 async function copyTextToClipboard(text: string) {
-  if (!navigator.clipboard?.writeText) {
-    copyTextFallback(text);
-    return;
-  }
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    copyTextFallback(text);
-  }
+  const nativeCopied = await invoke("write_text_clipboard", { text }).then(
+    () => true,
+    () => false,
+  );
+  const browserCopied = !nativeCopied && navigator.clipboard?.writeText
+    ? await navigator.clipboard.writeText(text).then(() => true, () => false)
+    : false;
+  const fallbackCopied = !nativeCopied && !browserCopied ? copyTextFallback(text) : false;
+  return nativeCopied || browserCopied || fallbackCopied;
 }
 
 async function copyPickerColorByShortcut() {
@@ -6180,9 +6253,12 @@ async function copyPickerColorByShortcut() {
   if (!text) {
     return false;
   }
-  await copyTextToClipboard(text);
-  adbStore.setNotice("success", `已复制 ${text}`);
-  return true;
+  if (await copyTextToClipboard(text)) {
+    adbStore.setNotice("success", `已复制 ${text}`);
+    return true;
+  }
+  adbStore.setNotice("error", "复制颜色失败");
+  return false;
 }
 
 function blurScreenshotToolbarFocusOnEscape(event: KeyboardEvent) {
@@ -6596,7 +6672,12 @@ onBeforeUnmount(() => {
               <span>{{ terminalStarting ? t("mirror.terminalStarting") : terminalSessionId ? t("mirror.terminalConnected") : t("mirror.terminalClosed") }}</span>
             </div>
           </div>
-          <div ref="terminalHostRef" class="terminal-host"></div>
+          <div
+            ref="terminalHostRef"
+            class="terminal-host"
+            data-allow-app-context-menu="true"
+            @contextmenu.prevent.stop="handleTerminalContextMenu"
+          ></div>
         </section>
       </div>
 

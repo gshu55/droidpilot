@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import * as vueCompiler from "vue/compiler-sfc";
 import { fileViewerRenderers } from "@file-viewer/vite-plugin";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -23,7 +24,7 @@ const jszipBrowserBundlePath = join(dirname(jszipPackagePath), "dist/jszip.min.j
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [
-    vue(),
+    vue({ compiler: vueCompiler }),
     fileViewerRenderers({
       preset: "all",
       inject: false,

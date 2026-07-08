@@ -670,7 +670,6 @@ fn copy_png_file_to_clipboard(path: &std::path::Path) -> Result<(), String> {
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn run_clipboard_stdin(command: &str, args: &[&str], bytes: &[u8]) -> Result<(), String> {
     let mut child = Command::new(command)
         .args(args)
@@ -700,9 +699,128 @@ fn run_clipboard_stdin(command: &str, args: &[&str], bytes: &[u8]) -> Result<(),
     }
 }
 
+#[cfg(target_os = "macos")]
+fn write_text_to_clipboard(text: &str) -> Result<(), String> {
+    run_clipboard_stdin("/usr/bin/pbcopy", &[], text.as_bytes())
+}
+
+#[cfg(target_os = "windows")]
+fn write_text_to_clipboard(text: &str) -> Result<(), String> {
+    run_clipboard_stdin(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-Command",
+            "$text = [Console]::In.ReadToEnd(); Set-Clipboard -Value $text",
+        ],
+        text.as_bytes(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn write_text_to_clipboard(text: &str) -> Result<(), String> {
+    let bytes = text.as_bytes();
+    let wl_result = run_clipboard_stdin("wl-copy", &["--type", "text/plain;charset=utf-8"], bytes);
+    if wl_result.is_ok() {
+        return Ok(());
+    }
+
+    let xclip_result = run_clipboard_stdin(
+        "xclip",
+        &[
+            "-selection",
+            "clipboard",
+            "-target",
+            "text/plain;charset=utf-8",
+            "-in",
+        ],
+        bytes,
+    );
+    if xclip_result.is_ok() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "写入剪贴板失败，请安装 wl-clipboard 或 xclip。wl-copy: {}; xclip: {}",
+        wl_result.err().unwrap_or_else(|| "不可用".to_string()),
+        xclip_result.err().unwrap_or_else(|| "不可用".to_string())
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn write_text_to_clipboard(_text: &str) -> Result<(), String> {
+    Err("当前平台暂不支持写入文本剪贴板".to_string())
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn copy_png_file_to_clipboard(_path: &std::path::Path) -> Result<(), String> {
     Err("当前平台暂不支持截图复制到剪贴板".to_string())
+}
+
+fn clipboard_stdout_text(output: Output, fallback: &str) -> Result<String, String> {
+    if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|err| format!("{fallback}: {err}"))
+    } else {
+        Err(adb_failure_message(&output, fallback))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_text_from_clipboard() -> Result<String, String> {
+    let output = Command::new("/usr/bin/pbpaste")
+        .output()
+        .map_err(|err| format!("读取剪贴板失败: {err}"))?;
+    clipboard_stdout_text(output, "读取剪贴板失败")
+}
+
+#[cfg(target_os = "windows")]
+fn read_text_from_clipboard() -> Result<String, String> {
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        .output()
+        .map_err(|err| format!("读取剪贴板失败: {err}"))?;
+    clipboard_stdout_text(output, "读取剪贴板失败")
+}
+
+#[cfg(target_os = "linux")]
+fn read_text_from_clipboard() -> Result<String, String> {
+    let wl_result = Command::new("wl-paste")
+        .output()
+        .map_err(|err| format!("wl-paste 启动失败: {err}"))
+        .and_then(|output| clipboard_stdout_text(output, "wl-paste 读取失败"));
+    if wl_result.is_ok() {
+        return wl_result;
+    }
+
+    let xclip_result = Command::new("xclip")
+        .args(["-selection", "clipboard", "-out"])
+        .output()
+        .map_err(|err| format!("xclip 启动失败: {err}"))
+        .and_then(|output| clipboard_stdout_text(output, "xclip 读取失败"));
+    if xclip_result.is_ok() {
+        return xclip_result;
+    }
+
+    Err(format!(
+        "读取剪贴板失败，请安装 wl-clipboard 或 xclip。wl-paste: {}; xclip: {}",
+        wl_result.err().unwrap_or_else(|| "不可用".to_string()),
+        xclip_result.err().unwrap_or_else(|| "不可用".to_string())
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn read_text_from_clipboard() -> Result<String, String> {
+    Err("当前平台暂不支持读取剪贴板".to_string())
+}
+
+#[tauri::command]
+fn read_text_clipboard() -> Result<String, String> {
+    read_text_from_clipboard()
+}
+
+#[tauri::command]
+fn write_text_clipboard(text: String) -> Result<(), String> {
+    write_text_to_clipboard(&text)
 }
 
 fn chrono_like_timestamp() -> u128 {
@@ -3003,6 +3121,8 @@ pub fn run() {
             read_preview_image_data_url,
             read_local_text_chunk,
             read_remote_text_chunk,
+            read_text_clipboard,
+            write_text_clipboard,
             install_apk_file,
             execute_adb_command,
             save_local_recording,
