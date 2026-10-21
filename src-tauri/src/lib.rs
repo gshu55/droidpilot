@@ -18,6 +18,8 @@ use tauri::Manager;
 
 mod scrcpy;
 mod updater;
+#[cfg(target_os = "windows")]
+mod windows_clipboard;
 
 // ── 内嵌 ADB 二进制 ────────────────────────────────────────────────────────────
 // 将各平台 adb 放入 src-tauri/binaries/<platform>/ 目录后重新编译，
@@ -671,32 +673,38 @@ fn copy_png_file_to_clipboard(path: &std::path::Path) -> Result<(), String> {
     ))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_clipboard_stdin(command: &str, args: &[&str], bytes: &[u8]) -> Result<(), String> {
-    let mut child = Command::new(command)
+    let mut process = Command::new(command);
+    #[cfg(target_os = "macos")]
+    process.env("LC_ALL", "en_US.UTF-8");
+    let mut child = process
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        // Clipboard owners may fork and retain stderr after the parent exits.
+        // Do not wait for EOF on a pipe held by that long-lived process.
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("{command} 启动失败: {err}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(bytes)
-            .map_err(|err| format!("{command} 写入失败: {err}"))?;
+        if let Err(err) = stdin.write_all(bytes) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{command} 写入失败: {err}"));
+        }
     }
 
-    let output = child
-        .wait_with_output()
+    let status = child
+        .wait()
         .map_err(|err| format!("{command} 等待失败: {err}"))?;
 
-    if output.status.success() {
+    if status.success() {
         Ok(())
     } else {
-        Err(adb_failure_message(
-            &output,
-            &format!("{command} 返回失败状态"),
-        ))
+        Err(format!("{command} 返回失败状态: {status}"))
     }
 }
 
@@ -707,15 +715,7 @@ fn write_text_to_clipboard(text: &str) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn write_text_to_clipboard(text: &str) -> Result<(), String> {
-    run_clipboard_stdin(
-        "powershell.exe",
-        &[
-            "-NoProfile",
-            "-Command",
-            "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); $text = [Console]::In.ReadToEnd(); Set-Clipboard -Value $text",
-        ],
-        text.as_bytes(),
-    )
+    windows_clipboard::write(text)
 }
 
 #[cfg(target_os = "linux")]
@@ -732,7 +732,7 @@ fn write_text_to_clipboard(text: &str) -> Result<(), String> {
             "-selection",
             "clipboard",
             "-target",
-            "text/plain;charset=utf-8",
+            "UTF8_STRING",
             "-in",
         ],
         bytes,
@@ -758,6 +758,7 @@ fn copy_png_file_to_clipboard(_path: &std::path::Path) -> Result<(), String> {
     Err("当前平台暂不支持截图复制到剪贴板".to_string())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn clipboard_stdout_text(output: Output, fallback: &str) -> Result<String, String> {
     if output.status.success() {
         String::from_utf8(output.stdout).map_err(|err| format!("{fallback}: {err}"))
@@ -769,6 +770,8 @@ fn clipboard_stdout_text(output: Output, fallback: &str) -> Result<String, Strin
 #[cfg(target_os = "macos")]
 fn read_text_from_clipboard() -> Result<String, String> {
     let output = Command::new("/usr/bin/pbpaste")
+        .env("LC_ALL", "en_US.UTF-8")
+        .args(["-Prefer", "txt"])
         .output()
         .map_err(|err| format!("读取剪贴板失败: {err}"))?;
     clipboard_stdout_text(output, "读取剪贴板失败")
@@ -776,16 +779,13 @@ fn read_text_from_clipboard() -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 fn read_text_from_clipboard() -> Result<String, String> {
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Write([string](Get-Clipboard -Raw))"])
-        .output()
-        .map_err(|err| format!("读取剪贴板失败: {err}"))?;
-    clipboard_stdout_text(output, "读取剪贴板失败")
+    windows_clipboard::read()
 }
 
 #[cfg(target_os = "linux")]
 fn read_text_from_clipboard() -> Result<String, String> {
     let wl_result = Command::new("wl-paste")
+        .args(["--no-newline", "--type", "text"])
         .output()
         .map_err(|err| format!("wl-paste 启动失败: {err}"))
         .and_then(|output| clipboard_stdout_text(output, "wl-paste 读取失败"));
@@ -794,7 +794,7 @@ fn read_text_from_clipboard() -> Result<String, String> {
     }
 
     let xclip_result = Command::new("xclip")
-        .args(["-selection", "clipboard", "-out"])
+        .args(["-selection", "clipboard", "-target", "UTF8_STRING", "-out"])
         .output()
         .map_err(|err| format!("xclip 启动失败: {err}"))
         .and_then(|output| clipboard_stdout_text(output, "xclip 读取失败"));
@@ -815,13 +815,17 @@ fn read_text_from_clipboard() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn read_text_clipboard() -> Result<String, String> {
-    read_text_from_clipboard()
+async fn read_text_clipboard() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(read_text_from_clipboard)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn write_text_clipboard(text: String) -> Result<(), String> {
-    write_text_to_clipboard(&text)
+async fn write_text_clipboard(text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_text_to_clipboard(&text))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn chrono_like_timestamp() -> u128 {
