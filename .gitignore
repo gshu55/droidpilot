@@ -11,6 +11,9 @@ Thumbs.db
 src-tauri/gen/
 src-tauri/.tauri/
 
+# Local updater signing keys; never commit private keys.
+.release-signing/
+
 *-lock.json
 *-lock.yaml
 !package-lock.json

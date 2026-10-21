@@ -3,10 +3,6 @@ name: Release
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/release.yml'
     tags:
       - 'v*'
 
@@ -14,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -59,19 +55,26 @@ jobs:
             throw 'Release tag and application versions must match'
           }
       - run: pnpm install --frozen-lockfile
+      - name: Test update state
+        run: node --test tests/app-update.test.cjs
+      - name: Verify updater signing configuration
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'Add the DroidPilot signing key to the TAURI_SIGNING_PRIVATE_KEY repository secret before publishing.'
+          }
       - name: Test backend
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
       - name: Build Windows installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles nsis
       - name: Prepare release assets
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path release-assets | Out-Null
-          Copy-Item src-tauri/target/release/bundle/nsis/*.exe release-assets/
-          Copy-Item src-tauri/target/release/droidpilot.exe "release-assets/DroidPilot_$($env:RELEASE_TAG)_windows_x64_portable.exe"
-          Get-ChildItem release-assets -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
-            "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)"
-          } | Set-Content release-assets/SHA256SUMS.txt -Encoding utf8NoBOM
+        run: ./.github/scripts/prepare-release.ps1 -Tag $env:RELEASE_TAG
       - uses: actions/upload-artifact@v4
         with:
           name: windows-release
@@ -83,5 +86,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $assets = @(Get-ChildItem release-assets -File | ForEach-Object FullName)
-          gh release create $env:RELEASE_TAG @assets --verify-tag --title "DroidPilot $env:RELEASE_TAG" --notes-file "docs/releases/$($env:RELEASE_TAG).md"
+          gh release create $env:RELEASE_TAG @assets --draft --verify-tag --title "DroidPilot $env:RELEASE_TAG" --notes-file "docs/releases/$($env:RELEASE_TAG).md"
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
+          gh release edit $env:RELEASE_TAG --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release assets uploaded but publication failed' }

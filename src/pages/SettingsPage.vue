@@ -708,18 +708,6 @@ onMounted(async () => {
   padding: 12px;
 }
 
-:deep(.about-page h2) {
-  margin: 0 0 8px;
-  color: var(--text-main);
-  font-size: 20px;
-  font-weight: 600;
-  line-height: 1.25;
-}
-
-:deep(.about-item) {
-  background: var(--surface-alt);
-}
-
 @media (max-width: 700px) {
   .settings-tab {
     flex-basis: 104px;

@@ -17,6 +17,7 @@ use tauri::Emitter;
 use tauri::Manager;
 
 mod scrcpy;
+mod updater;
 
 // ── 内嵌 ADB 二进制 ────────────────────────────────────────────────────────────
 // 将各平台 adb 放入 src-tauri/binaries/<platform>/ 目录后重新编译，
@@ -3097,6 +3098,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 apply_windows_window_frame(&window, false);
@@ -3104,8 +3106,11 @@ pub fn run() {
             Ok(())
         })
         .manage(scrcpy::ScrcpyRegistry::default())
+        .manage(updater::UpdateService::default())
         .manage(TerminalRegistry::default())
         .invoke_handler(tauri::generate_handler![
+            updater::app_update_check,
+            updater::app_update_install,
             check_adb_availability,
             capture_device_screenshot,
             delete_local_entry,
