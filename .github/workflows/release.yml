@@ -3,6 +3,8 @@ name: Release
 on:
   workflow_dispatch:
   push:
+    branches: [main]
+    paths: ['.github/workflows/release.yml']
     tags: ['v*']
 
 permissions:
@@ -62,7 +64,7 @@ jobs:
         run: |
           node .github/scripts/release-assets.mjs verify "$RELEASE_TAG"
           if [[ "${{ matrix.platform }}" == darwin-aarch64 ]]; then
-            lipo -verify_arch arm64 src-tauri/binaries/macos/adb
+            lipo src-tauri/binaries/macos/adb -verify_arch arm64
           fi
       - run: pnpm install --frozen-lockfile
       - name: Test update state
