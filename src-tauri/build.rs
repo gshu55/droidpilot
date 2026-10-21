@@ -30,13 +30,13 @@ fn main() {
         }
     }
 
-    let scrcpy_server_path = "binaries/scrcpy/scrcpy-server-v3.3.4";
+    let scrcpy_server_path = "binaries/scrcpy/scrcpy-server-v4.1";
     if std::path::Path::new(scrcpy_server_path).exists() {
         println!("cargo:rustc-cfg=has_embedded_scrcpy_server");
         println!("cargo:rerun-if-changed={scrcpy_server_path}");
     } else {
         println!(
-            "cargo:warning=嵌入 scrcpy server 已禁用：缺少 binaries/scrcpy/scrcpy-server-v3.3.4"
+            "cargo:warning=嵌入 scrcpy server 已禁用：缺少 binaries/scrcpy/scrcpy-server-v4.1"
         );
     }
 

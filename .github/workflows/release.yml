@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version" -or $tauriVersion -ne $version -or $cargoVersion -ne $version) {
+            throw 'Release tag and application versions must match'
+          }
+      - run: pnpm install --frozen-lockfile
+      - name: Test backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
+      - name: Build Windows installer
+        run: pnpm tauri build --bundles nsis
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          Copy-Item src-tauri/target/release/bundle/nsis/*.exe release-assets/
+          Copy-Item src-tauri/target/release/droidpilot.exe "release-assets/DroidPilot_$($env:GITHUB_REF_NAME)_windows_x64_portable.exe"
+          Get-ChildItem release-assets -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
+            "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)"
+          } | Set-Content release-assets/SHA256SUMS.txt -Encoding utf8NoBOM
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: release-assets/*
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem release-assets -File | ForEach-Object FullName)
+          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --title "DroidPilot $env:GITHUB_REF_NAME" --notes-file "docs/releases/$($env:GITHUB_REF_NAME).md"
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

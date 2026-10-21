@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,15 +11,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 
-const SCRCPY_VERSION: &str = "3.3.4";
+const SCRCPY_VERSION: &str = "4.1";
 const DEVICE_SERVER_PATH: &str = "/data/local/tmp/scrcpy-server.jar";
 const DEVICE_NAME_FIELD_LENGTH: usize = 64;
 const POINTER_ID_GENERIC_FINGER: u64 = u64::MAX - 1;
 const ADB_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const INJECT_TEXT_MAX_BYTES: usize = 300;
+const CONTROL_MESSAGE_MAX_BYTES: usize = 1 << 18;
 
 #[cfg(has_embedded_scrcpy_server)]
-static SCRCPY_SERVER: &[u8] = include_bytes!("../binaries/scrcpy/scrcpy-server-v3.3.4");
+static SCRCPY_SERVER: &[u8] = include_bytes!("../binaries/scrcpy/scrcpy-server-v4.1");
 
 #[derive(Clone, Default)]
 pub struct ScrcpyRegistry {
@@ -84,6 +85,10 @@ struct ScrcpyFramePayload {
     key_frame: bool,
     config: bool,
     data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
 }
 
 fn get_scrcpy_server_path() -> &'static PathBuf {
@@ -93,13 +98,13 @@ fn get_scrcpy_server_path() -> &'static PathBuf {
         {
             let dir = std::env::temp_dir().join("droidpilot");
             fs::create_dir_all(&dir).expect("创建 scrcpy server 临时目录失败");
-            let path = dir.join("scrcpy-server-v3.3.4");
+            let path = dir.join("scrcpy-server-v4.1");
             fs::write(&path, SCRCPY_SERVER).expect("提取 scrcpy server 失败");
             path
         }
         #[cfg(not(has_embedded_scrcpy_server))]
         {
-            PathBuf::from("scrcpy-server-v3.3.4")
+            PathBuf::from("scrcpy-server-v4.1")
         }
     })
 }
@@ -231,12 +236,24 @@ fn read_device_name(stream: &mut TcpStream) -> Result<String, String> {
 }
 
 fn read_video_meta(stream: &mut TcpStream) -> Result<(String, u32, u32), String> {
-    let mut buf = [0u8; 12];
+    // v4: codec id followed by a 12-byte session header (flags, width, height).
+    let mut buf = [0u8; 16];
     read_exact_timeout(stream, &mut buf, "视频元数据")?;
     let codec = String::from_utf8_lossy(&buf[0..4]).to_string();
-    let width = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    let height = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let (width, height) = parse_session_meta(&buf[4..])?;
     Ok((codec, width, height))
+}
+
+fn parse_session_meta(header: &[u8]) -> Result<(u32, u32), String> {
+    if header.len() != 12 || header[0] & 0x80 == 0 {
+        return Err("无效的 scrcpy 会话元数据".to_string());
+    }
+    let width = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    let height = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    if width == 0 || height == 0 || width > u16::MAX as u32 || height > u16::MAX as u32 {
+        return Err(format!("无效的 scrcpy 视频尺寸: {width}x{height}"));
+    }
+    Ok((width, height))
 }
 
 fn emit_status(app: &AppHandle, session_id: u64, status: &str, message: impl Into<String>) {
@@ -252,7 +269,7 @@ fn emit_status(app: &AppHandle, session_id: u64, status: &str, message: impl Int
 }
 
 fn read_video_packet(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     session_id: u64,
 ) -> Result<ScrcpyFramePayload, String> {
     let mut header = [0u8; 12];
@@ -260,12 +277,24 @@ fn read_video_packet(
         .read_exact(&mut header)
         .map_err(|err| format!("读取视频包头失败: {err}"))?;
 
+    if header[0] & 0x80 != 0 {
+        let (width, height) = parse_session_meta(&header)?;
+        return Ok(ScrcpyFramePayload {
+            session_id,
+            pts: 0,
+            key_frame: false,
+            config: false,
+            data: String::new(),
+            width: Some(width),
+            height: Some(height),
+        });
+    }
     let pts_flags = u64::from_be_bytes([
         header[0], header[1], header[2], header[3], header[4], header[5], header[6], header[7],
     ]);
     let size = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
-    let is_key_frame = (pts_flags & (1u64 << 62)) != 0;
-    let is_config = (pts_flags & (1u64 << 63)) != 0;
+    let is_key_frame = (pts_flags & (1u64 << 61)) != 0;
+    let is_config = (pts_flags & (1u64 << 62)) != 0;
     if size == 0 || size > 16 * 1024 * 1024 {
         return Err(format!("异常视频包大小: {size}"));
     }
@@ -277,10 +306,12 @@ fn read_video_packet(
 
     Ok(ScrcpyFramePayload {
         session_id,
-        pts: pts_flags & 0x3fff_ffff_ffff_ffff,
+        pts: pts_flags & 0x1fff_ffff_ffff_ffff,
         key_frame: is_key_frame,
         config: is_config,
         data: general_purpose::STANDARD.encode(data),
+        width: None,
+        height: None,
     })
 }
 
@@ -318,6 +349,9 @@ fn spawn_video_reader(
 }
 
 fn cleanup_session(session: ScrcpySession) {
+    if let Ok(control) = session.control.lock() {
+        let _ = control.shutdown(Shutdown::Both);
+    }
     if let Ok(mut child) = session.child.lock() {
         let _ = child.kill();
         let _ = child.wait();
@@ -394,8 +428,9 @@ fn start_scrcpy_mirror_impl(
         format!("scid={scid}"),
         "log_level=info".to_string(),
         "audio=false".to_string(),
+        "control=true".to_string(),
         "video_codec=h264".to_string(),
-        "clipboard_autosync=false".to_string(),
+        "clipboard_autosync=true".to_string(),
         "cleanup=false".to_string(),
     ];
 
@@ -494,7 +529,7 @@ fn attach_scrcpy_mirror_impl(
     registry: ScrcpyRegistry,
     session_id: u64,
 ) -> Result<(), String> {
-    let (video_stream, max_fps) = {
+    let (video_stream, control_stream, max_fps) = {
         let sessions = registry
             .sessions
             .lock()
@@ -506,15 +541,128 @@ fn attach_scrcpy_mirror_impl(
             .video
             .lock()
             .map_err(|_| "scrcpy 视频通道已损坏".to_string())?;
+        let control_stream = session
+            .control
+            .lock()
+            .map_err(|_| "scrcpy 控制通道已损坏".to_string())?
+            .try_clone()
+            .map_err(|err| format!("复制控制通道失败: {err}"))?;
         let video_stream = video
             .take()
             .ok_or_else(|| "scrcpy 视频通道已接入".to_string())?;
-        (video_stream, session.max_fps)
+        (video_stream, control_stream, session.max_fps)
     };
 
     emit_status(&app, session_id, "running", "scrcpy server 已连接");
+    spawn_control_reader(app.clone(), session_id, control_stream);
     spawn_video_reader(app, registry, session_id, video_stream, max_fps);
     Ok(())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScrcpyClipboardPayload {
+    session_id: u64,
+    text: String,
+}
+
+// Device messages are independent of outgoing control messages on the same socket.
+fn read_device_message(stream: &mut impl Read) -> Result<Option<String>, String> {
+    let read = |stream: &mut dyn Read, buf: &mut [u8]| {
+        stream
+            .read_exact(buf)
+            .map_err(|err| format!("读取剪贴板消息失败: {err}"))
+    };
+    let mut kind = [0];
+    read(stream, &mut kind)?;
+    match kind[0] {
+        0 => {
+            let mut length = [0; 4];
+            read(stream, &mut length)?;
+            let length = u32::from_be_bytes(length) as usize;
+            if length > CONTROL_MESSAGE_MAX_BYTES - 5 {
+                return Err("手机剪贴板消息过大".into());
+            }
+            let mut text = vec![0; length];
+            read(stream, &mut text)?;
+            String::from_utf8(text)
+                .map(Some)
+                .map_err(|_| "手机剪贴板不是有效 UTF-8 文本".into())
+        }
+        1 => {
+            read(stream, &mut [0; 8])?; // clipboard acknowledgement
+            Ok(None)
+        }
+        2 => {
+            let mut header = [0; 4]; // UHID id + payload length
+            read(stream, &mut header)?;
+            let mut data = vec![0; u16::from_be_bytes([header[2], header[3]]) as usize];
+            read(stream, &mut data)?;
+            Ok(None)
+        }
+        value => Err(format!("未知 scrcpy 设备消息: {value}")),
+    }
+}
+
+fn spawn_control_reader(app: AppHandle, session_id: u64, mut stream: TcpStream) {
+    thread::spawn(move || loop {
+        match read_device_message(&mut stream) {
+            Ok(Some(text)) => {
+                if app
+                    .emit_to(
+                        "main",
+                        "scrcpy://clipboard",
+                        ScrcpyClipboardPayload { session_id, text },
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                emit_status(&app, session_id, "control-error", error);
+                break;
+            }
+        }
+    });
+}
+
+fn serialize_clipboard(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() > CONTROL_MESSAGE_MAX_BYTES - 14 {
+        return Err("剪贴板文本超过 256 KiB 协议限制，请分段粘贴".into());
+    }
+    let mut buf = Vec::with_capacity(14 + text.len());
+    buf.push(9); // SET_CLIPBOARD
+    write_u64be(&mut buf, 0); // no acknowledgement requested
+    buf.push(1); // paste after setting clipboard; preserves Unicode
+    write_u32be(&mut buf, text.len() as u32);
+    buf.extend_from_slice(text.as_bytes());
+    Ok(buf)
+}
+
+#[tauri::command]
+pub async fn scrcpy_clipboard(
+    registry: State<'_, ScrcpyRegistry>,
+    session_id: u64,
+    action: String,
+) -> Result<(), String> {
+    let registry = registry.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let payload = match action.as_str() {
+            "copy" => vec![8, 1], // GET_CLIPBOARD + COPY
+            "cut" => vec![8, 2],
+            "paste" => serialize_clipboard(&crate::read_text_from_clipboard()?)?,
+            _ => return Err("不支持的剪贴板操作".into()),
+        };
+        with_control_stream(&registry, session_id, |stream| {
+            stream
+                .write_all(&payload)
+                .map_err(|err| format!("发送剪贴板操作失败: {err}"))
+        })
+    })
+    .await
+    .map_err(|err| format!("剪贴板任务失败: {err}"))?
 }
 
 #[tauri::command]
@@ -612,8 +760,11 @@ fn serialize_touch(request: ScrcpyTouchRequest) -> Result<Vec<u8>, String> {
         _ => return Err("不支持的触控动作".to_string()),
     };
 
-    let x = request.x.clamp(0, request.video_width as i32);
-    let y = request.y.clamp(0, request.video_height as i32);
+    if request.video_width == 0 || request.video_height == 0 {
+        return Err("触控区域尺寸不能为空".to_string());
+    }
+    let x = request.x.clamp(0, request.video_width as i32 - 1);
+    let y = request.y.clamp(0, request.video_height as i32 - 1);
     let pressure = if action == 1 { 0 } else { u16::MAX };
 
     let mut buf = Vec::with_capacity(32);
@@ -682,6 +833,105 @@ fn serialize_text(text: &str) -> Vec<u8> {
     write_u32be(&mut buf, bytes.len() as u32);
     buf.extend_from_slice(bytes);
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn clipboard_unicode_wire_format_and_limits() {
+        let text = "中文🙂\nhello";
+        let packet = serialize_clipboard(text).unwrap();
+        assert_eq!(&packet[..10], &[9, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            u32::from_be_bytes(packet[10..14].try_into().unwrap()) as usize,
+            text.len()
+        );
+        assert_eq!(&packet[14..], text.as_bytes());
+        assert!(serialize_clipboard(&"a".repeat(CONTROL_MESSAGE_MAX_BYTES - 14)).is_ok());
+        assert!(serialize_clipboard(&"a".repeat(CONTROL_MESSAGE_MAX_BYTES - 13)).is_err());
+        let mut wire = vec![1, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 1, 0, 2, 42, 43, 0];
+        wire.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        wire.extend_from_slice(text.as_bytes());
+        wire.extend_from_slice(&[0, 0, 0, 0, 0]);
+        let mut stream = Cursor::new(wire);
+        assert_eq!(read_device_message(&mut stream).unwrap(), None);
+        assert_eq!(read_device_message(&mut stream).unwrap(), None);
+        assert_eq!(read_device_message(&mut stream).unwrap(), Some(text.into()));
+        assert_eq!(
+            read_device_message(&mut stream).unwrap(),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_device_messages() {
+        for bytes in [
+            vec![3],
+            vec![0, 0, 4, 0, 0],
+            vec![0, 0, 0, 0, 2, 65],
+            vec![0, 0, 0, 0, 1, 255],
+        ] {
+            assert!(read_device_message(&mut Cursor::new(bytes)).is_err());
+        }
+    }
+
+    #[test]
+    fn v4_session_header_does_not_consume_next_packet() {
+        let mut wire = vec![0x80, 0, 0, 1, 0, 0, 4, 0, 0, 0, 3, 0];
+        wire.extend_from_slice(&((1u64 << 61) | 123).to_be_bytes());
+        wire.extend_from_slice(&3u32.to_be_bytes());
+        wire.extend_from_slice(&[0, 0, 1]);
+        let mut stream = Cursor::new(wire);
+        let session = read_video_packet(&mut stream, 7).unwrap();
+        assert_eq!((session.width, session.height), (Some(1024), Some(768)));
+        let frame = read_video_packet(&mut stream, 7).unwrap();
+        assert!(frame.key_frame);
+        assert!(!frame.config);
+        assert_eq!(frame.pts, 123);
+        assert_eq!(frame.data, "AAAB");
+    }
+
+    #[test]
+    fn v4_config_flag_and_invalid_packets() {
+        let mut wire = (1u64 << 62).to_be_bytes().to_vec();
+        wire.extend_from_slice(&1u32.to_be_bytes());
+        wire.push(0x67);
+        let frame = read_video_packet(&mut Cursor::new(wire), 1).unwrap();
+        assert!(frame.config);
+        assert!(!frame.key_frame);
+        assert_eq!(frame.pts, 0);
+        assert!(read_video_packet(&mut Cursor::new(vec![0; 12]), 1).is_err());
+        assert!(parse_session_meta(&[0x80; 12]).is_err());
+        assert!(parse_session_meta(&[0; 12]).is_err());
+    }
+
+    #[test]
+    fn touch_matches_upstream_wire_layout() {
+        let request = |action: &str| ScrcpyTouchRequest {
+            session_id: 1,
+            action: action.into(),
+            pointer_id: Some(2),
+            x: 1080,
+            y: -1,
+            video_width: 1080,
+            video_height: 1920,
+        };
+        let down = serialize_touch(request("down")).unwrap();
+        assert_eq!(
+            down,
+            vec![
+                2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 4, 55, 0, 0, 0, 0, 4, 56, 7, 128, 255, 255, 0,
+                0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+        let up = serialize_touch(request("up")).unwrap();
+        assert_eq!(up[1], 1);
+        assert_eq!(&up[22..24], &[0, 0]);
+        assert!(serialize_touch(request("invalid")).is_err());
+    }
 }
 
 #[tauri::command]

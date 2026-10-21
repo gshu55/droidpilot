@@ -711,7 +711,7 @@ fn write_text_to_clipboard(text: &str) -> Result<(), String> {
         &[
             "-NoProfile",
             "-Command",
-            "$text = [Console]::In.ReadToEnd(); Set-Clipboard -Value $text",
+            "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); $text = [Console]::In.ReadToEnd(); Set-Clipboard -Value $text",
         ],
         text.as_bytes(),
     )
@@ -776,7 +776,7 @@ fn read_text_from_clipboard() -> Result<String, String> {
 #[cfg(target_os = "windows")]
 fn read_text_from_clipboard() -> Result<String, String> {
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        .args(["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Write([string](Get-Clipboard -Raw))"])
         .output()
         .map_err(|err| format!("读取剪贴板失败: {err}"))?;
     clipboard_stdout_text(output, "读取剪贴板失败")
@@ -3137,7 +3137,8 @@ pub fn run() {
             scrcpy::stop_scrcpy_mirror,
             scrcpy::scrcpy_touch,
             scrcpy::scrcpy_keyevent,
-            scrcpy::scrcpy_text
+            scrcpy::scrcpy_text,
+            scrcpy::scrcpy_clipboard
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

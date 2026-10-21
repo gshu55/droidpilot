@@ -54,6 +54,8 @@ interface ScrcpyFramePayload {
   keyFrame: boolean;
   config: boolean;
   data: string;
+  width?: number;
+  height?: number;
 }
 
 interface ScrcpyStatusPayload {
@@ -379,6 +381,8 @@ const mirrorTabs = ref<MirrorTab[]>([]);
 
 let unlistenFrame: UnlistenFn | null = null;
 let unlistenStatus: UnlistenFn | null = null;
+let unlistenClipboard: UnlistenFn | null = null;
+let clipboardWriteQueue = Promise.resolve();
 let unlistenTransferProgress: UnlistenFn | null = null;
 let unlistenTerminalOutput: UnlistenFn | null = null;
 let unlistenTerminalExit: UnlistenFn | null = null;
@@ -3472,6 +3476,14 @@ function handleFrame(payload: ScrcpyFramePayload) {
     return;
   }
 
+  // scrcpy v4 sends session metadata again when capture dimensions change.
+  // Input coordinates must use these dimensions or the server rejects touches.
+  if (payload.width && payload.height && tab.session) {
+    tab.session.width = payload.width;
+    tab.session.height = payload.height;
+    return;
+  }
+
   const bytes = base64ToBytes(payload.data);
 
   if (payload.config) {
@@ -6170,6 +6182,21 @@ function forwardMirrorKeyboardInput(event: KeyboardEvent) {
     return false;
   }
 
+  const clipboardKey = event.key.toLowerCase();
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey
+      && !event.isComposing && ["c", "x", "v"].includes(clipboardKey)) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!event.repeat) {
+      const sessionId = activeMirrorTab.value!.session!.sessionId;
+      const action = clipboardKey === "c" ? "copy" : clipboardKey === "x" ? "cut" : "paste";
+      void invoke("scrcpy_clipboard", { sessionId, action }).catch((error) => {
+        adbStore.setNotice("error", String(error));
+      });
+    }
+    return true;
+  }
+
   const text = mirrorKeyboardText(event);
   if (text) {
     event.preventDefault();
@@ -6326,6 +6353,17 @@ onMounted(async () => {
   window.setTimeout(emitMirrorToolbarState, 0);
   unlistenFrame = await listen<ScrcpyFramePayload>("scrcpy://frame", (event) => handleFrame(event.payload));
   unlistenStatus = await listen<ScrcpyStatusPayload>("scrcpy://status", (event) => handleStatus(event.payload));
+  unlistenClipboard = await listen<{ sessionId: number; text: string }>("scrcpy://clipboard", (event) => {
+    const { sessionId, text } = event.payload;
+    // Only the selected device may replace the computer clipboard.
+    if (activeMirrorTab.value?.session?.sessionId !== sessionId) return;
+    clipboardWriteQueue = clipboardWriteQueue.then(async () => {
+      if (activeMirrorTab.value?.session?.sessionId !== sessionId) return;
+      if (!await copyTextToClipboard(text)) {
+        adbStore.setNotice("error", "手机文本同步到电脑剪贴板失败");
+      }
+    }).catch((error) => adbStore.setNotice("error", String(error)));
+  });
   mirrorDebug("event-listeners-ready");
   resolveMirrorEventListenersReady?.();
   resolveMirrorEventListenersReady = null;
@@ -6371,6 +6409,7 @@ onBeforeUnmount(() => {
   stopTransferPaneResize();
   unlistenFrame?.();
   unlistenStatus?.();
+  unlistenClipboard?.();
   unlistenTransferProgress?.();
   unlistenTerminalOutput?.();
   unlistenTerminalExit?.();
