@@ -24,6 +24,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Verify updater signing configuration
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'Add the DroidPilot signing key to the TAURI_SIGNING_PRIVATE_KEY repository secret before publishing.'
+          }
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -61,14 +69,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Test update state
         run: node --test tests/app-update.test.cjs
-      - name: Verify updater signing configuration
-        shell: pwsh
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
-            throw 'Add the DroidPilot signing key to the TAURI_SIGNING_PRIVATE_KEY repository secret before publishing.'
-          }
       - name: Test backend
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
       - name: Build Windows installer
